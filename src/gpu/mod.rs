@@ -24,6 +24,7 @@ pub struct GpuConfig {
 pub struct GpuKangaroo {
     pub x: [u32; 8],
     pub y: [u32; 8],
+    pub z: [u32; 8],
     pub dist: [u32; 8],
     pub ktype: u32,
     pub is_active: u32,
@@ -43,4 +44,18 @@ pub struct GpuDistinguishedPoint {
     pub _padding: [u32; 6],
 }
 
-const _: [(); 128] = [(); core::mem::size_of::<GpuKangaroo>()];
+/// Candidate DP from Jacobian kernel (needs CPU verification via fe_inv)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuDpCandidate {
+    pub jac_x: [u32; 8],
+    pub jac_z: [u32; 8],
+    pub dist: [u32; 8],
+    pub ktype: u32,
+    pub kangaroo_id: u32,
+    pub step_idx: u32,
+    pub _padding: [u32; 5],
+}
+
+const _: [(); 160] = [(); core::mem::size_of::<GpuKangaroo>()];
+

@@ -7,7 +7,7 @@ use k256::elliptic_curve::ops::Reduce;
 use k256::{ProjectivePoint, Scalar, U256 as K256U256};
 use std::collections::HashMap;
 
-const MAX_DISTINGUISHED_POINTS: usize = 65_536;
+const MAX_DISTINGUISHED_POINTS: usize = 16_777_216;
 
 /// SCALAR_HALF = (n+1)/2 where n is secp256k1 order
 /// Property: 2 × SCALAR_HALF ≡ 1 (mod n)

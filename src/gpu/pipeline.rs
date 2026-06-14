@@ -47,16 +47,19 @@ impl KangarooPipeline {
             return Ok(pipeline);
         }
 
-        info!("Loading shader sources...");
+        info!("Loading Jacobian shader sources (no fe_inv - AMD compatible)...");
 
+        // Use the Jacobian kernel which eliminates fe_inv from the GPU
+        // This prevents AMD's shader compiler from hanging on the massive
+        // secp256k1 field inversion function.
         let field = crate::gpu_crypto::shaders::FIELD_WGSL;
         let curve = crate::gpu_crypto::shaders::CURVE_WGSL;
-        let kangaroo = include_str!("../shaders/kangaroo_affine.wgsl");
+        let kangaroo = include_str!("../shaders/kangaroo_jacobian.wgsl");
 
         let constants = [("WORKGROUP_SIZE", variant.size() as f64)];
 
         info!("Creating shader module...");
-        let shader = ctx.create_shader_module("Kangaroo Shader", &[field, curve, kangaroo]);
+        let shader = ctx.create_shader_module("Kangaroo Jacobian Shader", &[field, curve, kangaroo]);
         info!("Shader module created");
 
         info!("Creating bind group layout...");
@@ -158,7 +161,7 @@ impl KangarooPipeline {
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &constants,
-                    zero_initialize_workgroup_memory: true,
+                    zero_initialize_workgroup_memory: false,
                 },
                 cache: None,
             });

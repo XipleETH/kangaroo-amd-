@@ -4,7 +4,7 @@
 //! the previous dispatch while the GPU is already executing the next one.
 
 use super::{
-    GpuAffinePoint, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuKangaroo, KangarooPipeline,
+    GpuAffinePoint, GpuConfig, GpuContext, GpuDpCandidate, GpuKangaroo, KangarooPipeline,
 };
 use anyhow::Result;
 use wgpu::{BindGroup, Buffer, BufferUsages};
@@ -74,13 +74,13 @@ impl GpuBuffers {
         )?;
 
         let kangaroos_size = (num_kangaroos as usize) * std::mem::size_of::<GpuKangaroo>();
-        let dp_size = (max_dps as usize) * std::mem::size_of::<GpuDistinguishedPoint>();
+        let dp_size = (max_dps as usize) * std::mem::size_of::<GpuDpCandidate>();
         let staging_size = std::cmp::max(kangaroos_size, dp_size) as u64 + 4;
 
         let make_slot = |i: usize| -> Result<DpSlot> {
             let label_suffix = if i == 0 { "A" } else { "B" };
 
-            let dp_buffer = ctx.create_buffer::<GpuDistinguishedPoint>(
+            let dp_buffer = ctx.create_buffer::<GpuDpCandidate>(
                 &format!("DP Buffer {label_suffix}"),
                 BufferUsages::STORAGE | BufferUsages::COPY_SRC,
                 max_dps as u64,

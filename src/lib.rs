@@ -780,8 +780,12 @@ fn run_single_gpu_solver(
     let dp_bits = args.dp_bits.map(|v| v.clamp(8, 40)).unwrap_or_else(|| {
         let density_penalty = (num_k as f64).log2() as u32 / 2;
         let density_tweak = if effective_range <= 40 { 2 } else { 0 };
+        // Compensate for steps_per_call > 1: we only check DPs every N steps,
+        // so reduce dp_bits by log2(steps) to maintain the same DP discovery rate.
+        // steps_per_call=32 → subtract 5 bits.
+        let steps_penalty: u32 = 5;
         let auto_dp =
-            (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak));
+            (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak).saturating_add(steps_penalty));
         auto_dp.clamp(8, 40)
     });
 

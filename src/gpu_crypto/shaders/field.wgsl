@@ -829,6 +829,18 @@ fn fe_square(a: array<u32, 8>) -> array<u32, 8> {
 // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
 // Bit structure: [223 ones][0][22 ones][0000][10][11][01]
 // -----------------------------------------------------------------------------
+
+// Helper: compute t = fe_square applied n times
+// Using a function parameter prevents AMD's shader compiler from
+// attempting to unroll the loop at compile time (which causes infinite hangs).
+fn fe_sqr_n(val: array<u32, 8>, n: u32) -> array<u32, 8> {
+    var r = val;
+    for (var i = 0u; i < n; i = i + 1u) {
+        r = fe_square(r);
+    }
+    return r;
+}
+
 fn fe_inv(a: array<u32, 8>) -> array<u32, 8> {
     // ===== BUILD: compute a^(2^n - 1) blocks =====
 
@@ -838,49 +850,45 @@ fn fe_inv(a: array<u32, 8>) -> array<u32, 8> {
     var t = fe_square(x2);
     let x3 = fe_mul(t, a);                     // a^(2^3-1) = a^7
 
-    t = x3;
-    for (var i = 0u; i < 3u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(x3, 3u);
     t = fe_mul(t, x3);                         // a^(2^6-1)
-    for (var i = 0u; i < 3u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(t, 3u);
     t = fe_mul(t, x3);                         // a^(2^9-1)
-    for (var i = 0u; i < 2u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(t, 2u);
     let x11 = fe_mul(t, x2);                   // a^(2^11-1)
 
-    t = x11;
-    for (var i = 0u; i < 11u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(x11, 11u);
     let x22 = fe_mul(t, x11);                  // a^(2^22-1)
 
-    t = x22;
-    for (var i = 0u; i < 22u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(x22, 22u);
     let x44 = fe_mul(t, x22);                  // a^(2^44-1)
 
-    t = x44;
-    for (var i = 0u; i < 44u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(x44, 44u);
     let x88 = fe_mul(t, x44);                  // a^(2^88-1)
 
     // ===== ASSEMBLY: combine blocks for p-2 =====
     // Build a^(2^223-1) = x223
 
-    t = x88;
-    for (var i = 0u; i < 88u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(x88, 88u);
     t = fe_mul(t, x88);                        // a^(2^176-1)
-    for (var i = 0u; i < 44u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(t, 44u);
     t = fe_mul(t, x44);                        // a^(2^220-1)
-    for (var i = 0u; i < 3u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(t, 3u);
     t = fe_mul(t, x3);                         // a^(2^223-1)
 
     // bit 32 = 0, bits 31-10 = 22 ones
-    for (var i = 0u; i < 23u; i = i + 1u) { t = fe_square(t); }
+    t = fe_sqr_n(t, 23u);
     t = fe_mul(t, x22);
 
     // bits 9-0 = 0000_10_11_01 (2-bit windows)
-    t = fe_square(fe_square(fe_square(fe_square(t))));  // 4 zeros
-    t = fe_square(fe_square(t));
+    t = fe_sqr_n(t, 4u);                       // 4 zeros
+    t = fe_sqr_n(t, 2u);
     t = fe_mul(t, a2);                         // window 10 = a^2
-    t = fe_square(fe_square(t));
+    t = fe_sqr_n(t, 2u);
     t = fe_mul(t, x2);                         // window 11 = a^3
-    t = fe_square(fe_square(t));
+    t = fe_sqr_n(t, 2u);
     t = fe_mul(t, a);                          // window 01 = a^1
 
     return t;
 }
+

@@ -184,6 +184,7 @@ pub fn initialize_kangaroos(
             GpuKangaroo {
                 x: gpu_point.x,
                 y: gpu_point.y,
+                z: [1, 0, 0, 0, 0, 0, 0, 0], // Z = 1 (affine-equivalent Jacobian)
                 dist,
                 ktype,
                 is_active: 1,
