@@ -127,6 +127,14 @@ pub struct Args {
     /// Modular residue (hex): class residue for constraint (0 ≤ R < M) [e.g. 25 = 37]
     #[arg(long, default_value = "0")]
     mod_start: String,
+
+    /// Kangaroo mode: both (default), tame-only, or wild-only (for pool mode)
+    #[arg(long, default_value = "both")]
+    mode: String,
+
+    /// Write distinguished points to binary file (for pool bridge)
+    #[arg(long)]
+    dp_output: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -780,10 +788,10 @@ fn run_single_gpu_solver(
     let dp_bits = args.dp_bits.map(|v| v.clamp(8, 40)).unwrap_or_else(|| {
         let density_penalty = (num_k as f64).log2() as u32 / 2;
         let density_tweak = if effective_range <= 40 { 2 } else { 0 };
-        // Compensate for steps_per_call > 1: we only check DPs every N steps,
-        // so reduce dp_bits by log2(steps) to maintain the same DP discovery rate.
-        // steps_per_call=32 → subtract 5 bits.
-        let steps_penalty: u32 = 5;
+        // Compensate for steps_per_call > 1: the shader checks DPs every step,
+        // but larger dispatches accumulate more DPs. Subtract log2(steps) bits.
+        // steps_per_call=512 → subtract 9 bits.
+        let steps_penalty: u32 = 9;
         let auto_dp =
             (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak).saturating_add(steps_penalty));
         auto_dp.clamp(8, 40)
@@ -803,9 +811,10 @@ fn run_single_gpu_solver(
             dp_bits,
             num_k,
             c.base_point,
+            args.mode.clone(),
         )?,
         None => {
-            solver::KangarooSolver::new(gpu_context, pubkey, start, range_bits, dp_bits, num_k)?
+            solver::KangarooSolver::new(gpu_context, pubkey, start, range_bits, dp_bits, num_k, args.mode.clone())?
         }
     };
 
@@ -833,10 +842,46 @@ fn run_single_gpu_solver(
 
     let start_time = Instant::now();
 
+    // Open DP output file if configured
+    let mut dp_output_file = args.dp_output.as_ref().map(|path| {
+        info!("Writing DPs to: {}", path);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("Failed to open DP output file")
+    });
+
     loop {
         let result = solver.step()?;
         let total_ops = solver.total_operations();
         pb.set_position(total_ops);
+
+        // Write DPs to file for pool bridge
+        if let Some(ref mut file) = dp_output_file {
+            use std::io::Write;
+            let dps = solver.get_last_dps();
+            for dp in dps {
+                // Format: [x: 32B BE] [dist: 32B BE] [type: 1B] [dp_bits: 1B]
+                let mut record = [0u8; 66];
+                // x: convert [u32;8] LE limbs to 32-byte BE
+                for (i, limb) in dp.x.iter().enumerate() {
+                    let bytes = limb.to_le_bytes();
+                    record[28 - i*4..32 - i*4].copy_from_slice(&bytes);
+                }
+                // dist: convert [u32;8] LE limbs to 32-byte BE
+                for (i, limb) in dp.dist.iter().enumerate() {
+                    let bytes = limb.to_le_bytes();
+                    record[60 - i*4..64 - i*4].copy_from_slice(&bytes);
+                }
+                record[64] = dp.ktype as u8;
+                record[65] = dp_bits as u8;
+                let _ = file.write_all(&record);
+            }
+            if !dps.is_empty() {
+                let _ = file.flush();
+            }
+        }
 
         if let Some(j_or_key) = result {
             let private_key = match constraint {
@@ -1329,13 +1374,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
 
                 match solver.step_collect() {
-                    Ok((dps, ops_delta)) => {
+                    Ok((candidates, ops_delta)) => {
                         total_ops.fetch_add(ops_delta, Ordering::Relaxed);
-                        if dps.is_empty() {
+                        if candidates.is_empty() {
                             continue;
                         }
-                        if tx.send(dps).is_err() {
-                            break;
+                        match solver.convert_candidates_to_dps(candidates) {
+                            Ok(dps) if !dps.is_empty() => {
+                                if tx.send(dps).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(_) => continue,
+                            Err(e) => {
+                                tracing::warn!("GPU worker {} conversion error: {}", gpu_index, e);
+                                continue;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1345,9 +1399,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
             }
             // Drain the last pipelined batch
-            if let Ok(dps) = solver.flush_pending() {
-                if !dps.is_empty() {
-                    let _ = tx.send(dps);
+            if let Ok(candidates) = solver.flush_pending() {
+                if !candidates.is_empty() {
+                    if let Ok(dps) = solver.convert_candidates_to_dps(candidates) {
+                        if !dps.is_empty() {
+                            let _ = tx.send(dps);
+                        }
+                    }
                 }
             }
         });

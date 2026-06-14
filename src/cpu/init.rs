@@ -88,6 +88,7 @@ pub fn initialize_kangaroos(
     base_point: &ProjectivePoint,
     kangaroo_offset: u32,
     global_kangaroo_count: u32,
+    mode: &str,
 ) -> Result<Vec<GpuKangaroo>> {
     anyhow::ensure!(
         num_kangaroos >= 3,
@@ -137,12 +138,20 @@ pub fn initialize_kangaroos(
     let kangaroos: Vec<GpuKangaroo> = (0..num_kangaroos)
         .into_par_iter()
         .map(|i| {
-            let ktype = if i < one_third {
-                0 // tame
-            } else if i < 2 * one_third {
-                1 // wild_1
-            } else {
-                2 // wild_2
+            let ktype = match mode {
+                "tame" => 0,  // all tame
+                "wild" => {
+                    if i < num_kangaroos / 2 { 1 } else { 2 }  // half wild_1, half wild_2
+                },
+                _ => {  // "both" - original behavior
+                    if i < one_third {
+                        0 // tame
+                    } else if i < 2 * one_third {
+                        1 // wild_1
+                    } else {
+                        2 // wild_2
+                    }
+                }
             };
 
             // Grid-based offset + small random jitter (all 256-bit)
@@ -376,6 +385,7 @@ mod tests {
             &ProjectivePoint::GENERATOR,
             0,
             num_kangaroos,
+            "both",
         )
         .unwrap();
         assert_eq!(kangaroos.len(), num_kangaroos as usize);
@@ -396,7 +406,7 @@ mod tests {
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
         let result =
-            initialize_kangaroos(&pubkey, &start, 20, 2, &ProjectivePoint::GENERATOR, 0, 2);
+            initialize_kangaroos(&pubkey, &start, 20, 2, &ProjectivePoint::GENERATOR, 0, 2, "both");
         assert!(result.is_err(), "Should fail for num_kangaroos < 3");
         assert!(result.unwrap_err().to_string().contains("at least 3"));
     }
@@ -420,6 +430,7 @@ mod tests {
             &ProjectivePoint::GENERATOR,
             0,
             total_k,
+            "both",
         )
         .unwrap();
 
@@ -431,6 +442,7 @@ mod tests {
             &ProjectivePoint::GENERATOR,
             per_gpu_k,
             total_k,
+            "both",
         )
         .unwrap();
 
@@ -466,6 +478,7 @@ mod tests {
             &ProjectivePoint::GENERATOR,
             0,
             num_kangaroos,
+            "both",
         )
         .unwrap();
 
@@ -500,6 +513,7 @@ mod tests {
             &ProjectivePoint::GENERATOR,
             0,
             num_kangaroos,
+            "both",
         )
         .unwrap();
 
@@ -521,7 +535,7 @@ mod tests {
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
         let result =
-            initialize_kangaroos(&pubkey, &start, 256, 6, &ProjectivePoint::GENERATOR, 0, 6);
+            initialize_kangaroos(&pubkey, &start, 256, 6, &ProjectivePoint::GENERATOR, 0, 6, "both");
         assert!(result.is_err());
     }
 
@@ -531,7 +545,7 @@ mod tests {
         let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
-        let result = initialize_kangaroos(&pubkey, &start, 0, 6, &ProjectivePoint::GENERATOR, 0, 6);
+        let result = initialize_kangaroos(&pubkey, &start, 0, 6, &ProjectivePoint::GENERATOR, 0, 6, "both");
         assert!(result.is_err());
     }
 

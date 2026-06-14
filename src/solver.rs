@@ -6,8 +6,8 @@ use crate::cpu::init::{generate_jump_tables, initialize_kangaroos};
 use crate::cpu::DPTable;
 use crate::crypto::{Point, U256};
 use crate::gpu::{
-    GpuBuffers, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuKangaroo, JumpTableData,
-    KangarooPipeline, WorkgroupVariant,
+    GpuBuffers, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuDpCandidate, GpuKangaroo,
+    JumpTableData, KangarooPipeline, WorkgroupVariant,
 };
 use anyhow::{anyhow, ensure, Result};
 use k256::elliptic_curve::Field;
@@ -49,6 +49,8 @@ pub struct KangarooSolver {
     current_slot: usize,
     prev_submission: Option<wgpu::SubmissionIndex>,
     dp_bits_stored: u32,
+    last_dps: Vec<GpuDistinguishedPoint>,
+    mode: String,
 }
 
 impl KangarooSolver {
@@ -71,6 +73,7 @@ impl KangarooSolver {
         range_bits: u32,
         dp_bits: u32,
         num_kangaroos: u32,
+        mode: String,
     ) -> Result<Self> {
         Self::new_internal(
             ctx,
@@ -84,6 +87,7 @@ impl KangarooSolver {
             true,
             ProjectivePoint::GENERATOR,
             0,
+            mode,
         )
     }
 
@@ -99,6 +103,7 @@ impl KangarooSolver {
         dp_bits: u32,
         num_kangaroos: u32,
         base_point: ProjectivePoint,
+        mode: String,
     ) -> Result<Self> {
         Self::new_internal(
             ctx,
@@ -112,6 +117,7 @@ impl KangarooSolver {
             true,
             base_point,
             0,
+            mode,
         )
     }
 
@@ -139,6 +145,7 @@ impl KangarooSolver {
             false,
             base_point,
             kangaroo_offset,
+            "both".to_string(),
         )
     }
 
@@ -244,6 +251,7 @@ impl KangarooSolver {
         with_dp_table: bool,
         base_point: ProjectivePoint,
         kangaroo_offset: u32,
+        mode: String,
     ) -> Result<Self> {
         if verbose {
             info!("Generating jump table...");
@@ -297,6 +305,7 @@ impl KangarooSolver {
             &base_point,
             kangaroo_offset,
             global_kangaroo_count,
+            &mode,
         )?;
 
         if verbose {
@@ -355,6 +364,8 @@ impl KangarooSolver {
             current_slot: 0,
             prev_submission: None,
             dp_bits_stored: dp_bits,
+            last_dps: Vec::new(),
+            mode,
         };
 
         // Auto-calibrate steps_per_call
@@ -388,7 +399,7 @@ impl KangarooSolver {
     /// from the previous slot. The first call returns no DPs (nothing
     /// pending yet); steady-state calls overlap GPU compute with CPU
     /// readback.
-    pub fn step_collect(&mut self) -> Result<(Vec<GpuDistinguishedPoint>, u64)> {
+    pub fn step_collect(&mut self) -> Result<(Vec<GpuDpCandidate>, u64)> {
         let write_slot = self.current_slot;
         let read_slot = 1 - write_slot;
 
@@ -444,7 +455,7 @@ impl KangarooSolver {
         &self,
         slot: usize,
         submission: wgpu::SubmissionIndex,
-    ) -> Result<Vec<GpuDistinguishedPoint>> {
+    ) -> Result<Vec<GpuDpCandidate>> {
         let count = self.read_slot_dp_count(slot, submission)?;
         let dps = if count == 0 {
             Vec::new()
@@ -455,7 +466,7 @@ impl KangarooSolver {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Kangaroo DP Copy Encoder"),
                     });
-            let dp_size = std::mem::size_of::<GpuDistinguishedPoint>() as u64;
+            let dp_size = std::mem::size_of::<GpuDpCandidate>() as u64;
             let clamped = count.min(GPU_DP_BUFFER_SIZE);
             copy_encoder.copy_buffer_to_buffer(
                 self.buffers.dp_buffer(slot),
@@ -474,7 +485,7 @@ impl KangarooSolver {
     /// Drain the pipeline: read back DPs from the last dispatched batch.
     ///
     /// Call after the solve loop exits to collect any remaining results.
-    pub fn flush_pending(&mut self) -> Result<Vec<GpuDistinguishedPoint>> {
+    pub fn flush_pending(&mut self) -> Result<Vec<GpuDpCandidate>> {
         let Some(prev_sub) = self.prev_submission.take() else {
             return Ok(Vec::new());
         };
@@ -658,10 +669,17 @@ impl KangarooSolver {
 
     /// Run one batch of GPU operations.
     pub fn step(&mut self) -> Result<Option<Vec<u8>>> {
-        let (_, ops_delta) = self.step_collect()?;
+        let (candidates, ops_delta) = self.step_collect()?;
 
-        // Normalize kangaroos and check DPs on CPU
-        let dps = self.normalize_and_check_dps()?;
+        // In pool mode, use full CPU normalization to catch ALL DPs
+        // (the Jacobian GPU shader doesn't write to the DP candidate buffer)
+        let dps = if self.mode != "both" {
+            self.normalize_and_check_dps()?
+        } else {
+            // Convert shader DP candidates to verified affine DPs
+            // (batch inversion of ~0-10 candidates, not 65K kangaroos)
+            self.convert_candidates_to_dps(candidates)?
+        };
 
         if self.total_ops % 10_000_000 < ops_delta {
             if let Some(dp_table) = self.dp_table.as_ref() {
@@ -678,14 +696,22 @@ impl KangarooSolver {
         }
 
         if let Some(dp_table) = self.dp_table.as_mut() {
-            for dp in dps {
-                if let Some(key) = dp_table.insert_and_check(dp) {
+            for dp in &dps {
+                if let Some(key) = dp_table.insert_and_check(dp.clone()) {
+                    self.last_dps = dps;
                     return Ok(Some(key));
                 }
             }
         }
 
+        self.last_dps = dps;
+
         Ok(None)
+    }
+
+    /// Get the DPs found during the last step() call
+    pub fn get_last_dps(&self) -> &[GpuDistinguishedPoint] {
+        &self.last_dps
     }
 
     /// Get total operations performed
@@ -729,14 +755,14 @@ impl KangarooSolver {
         slot: usize,
         count: u32,
         submission: wgpu::SubmissionIndex,
-    ) -> Result<Vec<GpuDistinguishedPoint>> {
-        let dp_size = std::mem::size_of::<GpuDistinguishedPoint>();
+    ) -> Result<Vec<GpuDpCandidate>> {
+        let dp_size = std::mem::size_of::<GpuDpCandidate>();
         let actual_count = (count as usize).min(GPU_DP_BUFFER_SIZE as usize);
         let total_size = actual_count * dp_size;
 
         let staging = self.buffers.staging_buffer(slot);
         let slice = staging.slice(0..total_size as u64);
-        let result = (|| -> Result<Vec<GpuDistinguishedPoint>> {
+        let result = (|| -> Result<Vec<GpuDpCandidate>> {
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
@@ -756,10 +782,10 @@ impl KangarooSolver {
             map_result.map_err(|e| anyhow!("Failed to map DP payload buffer: {e:?}"))?;
 
             let data = slice.get_mapped_range();
-            let dps: Vec<GpuDistinguishedPoint> = data
+            let dps: Vec<GpuDpCandidate> = data
                 .chunks_exact(dp_size)
                 .take(actual_count)
-                .map(|chunk| *bytemuck::from_bytes::<GpuDistinguishedPoint>(chunk))
+                .map(|chunk| *bytemuck::from_bytes::<GpuDpCandidate>(chunk))
                 .collect();
 
             drop(data);
@@ -793,9 +819,18 @@ impl KangarooSolver {
             // identical paths for all N steps. We only check DPs at the end of each
             // dispatch (after normalization), losing intermediate DPs, but this is
             // more than compensated by the ~30x higher throughput.
-            self.steps_per_call = 32;
-            if verbose {
-                info!("Using steps_per_call=32 for Jacobian kernel (high throughput)");
+            // For pool mode (mode != "both"), use steps_per_call=1 to catch ALL DPs.
+            // For solo mode, use 512 for ~30x higher throughput (loses intermediate DPs).
+            if self.mode == "both" {
+                self.steps_per_call = 512;
+                if verbose {
+                    info!("Using steps_per_call=512 for Jacobian kernel (high throughput)");
+                }
+            } else {
+                self.steps_per_call = 1;
+                if verbose {
+                    info!("Using steps_per_call=1 for pool mode (captures all DPs)");
+                }
             }
             return Ok(());
         }
@@ -919,6 +954,102 @@ impl KangarooSolver {
             .map_err(|e| anyhow!("GPU poll timed out or failed during dispatch: {e:?}"))?;
 
         Ok(())
+    }
+
+    /// Convert GPU DP candidates (Jacobian coords) to verified affine DPs.
+    ///
+    /// Uses Montgomery batch inversion on just the few candidates (~0-10)
+    /// instead of normalizing all 65K kangaroos. The shader's DP check is
+    /// approximate (done on Jacobian X), so we verify here with the true
+    /// affine X coordinate.
+    pub fn convert_candidates_to_dps(
+        &self,
+        candidates: Vec<GpuDpCandidate>,
+    ) -> Result<Vec<GpuDistinguishedPoint>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let dp_meta = Self::dp_meta(self.dp_bits_stored);
+
+        // Collect valid Z field elements for batch inversion
+        let z_fes: Vec<Option<k256::FieldElement>> = candidates
+            .iter()
+            .map(|c| {
+                let z_fe = limbs_to_field_element(&c.jac_z);
+                if bool::from(z_fe.is_zero()) {
+                    None
+                } else {
+                    Some(z_fe)
+                }
+            })
+            .collect();
+
+        // Collect indices + Z values that need inversion
+        let mut need_inv: Vec<(usize, k256::FieldElement)> = Vec::with_capacity(candidates.len());
+        for (i, z_opt) in z_fes.iter().enumerate() {
+            if let Some(z_fe) = z_opt {
+                need_inv.push((i, *z_fe));
+            }
+        }
+
+        // Montgomery batch inversion: 1 inversion + 3*(N-1) muls
+        let z_invs = if need_inv.is_empty() {
+            Vec::new()
+        } else {
+            let m = need_inv.len();
+            let mut products = Vec::with_capacity(m);
+            products.push(need_inv[0].1);
+            for j in 1..m {
+                products.push(products[j - 1] * need_inv[j].1);
+            }
+            let mut inv_acc = products[m - 1].invert().unwrap();
+            let mut inverses = vec![k256::FieldElement::ZERO; m];
+            for j in (1..m).rev() {
+                inverses[j] = inv_acc * products[j - 1];
+                inv_acc = inv_acc * need_inv[j].1;
+            }
+            inverses[0] = inv_acc;
+            inverses
+        };
+
+        // Build inverse lookup
+        let n = candidates.len();
+        let mut inv_map: Vec<Option<k256::FieldElement>> = vec![None; n];
+        for (j, &(idx, _)) in need_inv.iter().enumerate() {
+            inv_map[idx] = Some(z_invs[j]);
+        }
+
+        // Convert to affine and verify DP property
+        let mut verified_dps = Vec::new();
+        for (i, candidate) in candidates.iter().enumerate() {
+            if let Some(z_inv) = inv_map[i] {
+                let z_inv2 = z_inv.square();
+                let x_affine = limbs_to_field_element(&candidate.jac_x) * z_inv2;
+                let x_limbs = field_element_to_limbs(&x_affine);
+
+                // Verify the DP property with the true affine X
+                if Self::is_dp_cpu(&x_limbs, &dp_meta) {
+                    verified_dps.push(GpuDistinguishedPoint {
+                        x: x_limbs,
+                        dist: candidate.dist,
+                        ktype: candidate.ktype,
+                        kangaroo_id: candidate.kangaroo_id,
+                        _padding: [0; 6],
+                    });
+                }
+            }
+        }
+
+        if !verified_dps.is_empty() {
+            tracing::debug!(
+                "DP candidates: {} from shader, {} verified",
+                candidates.len(),
+                verified_dps.len()
+            );
+        }
+
+        Ok(verified_dps)
     }
 }
 

@@ -87,6 +87,7 @@ pub fn run_with_context(ctx: gpu_crypto::GpuContext, save_to_markdown: bool) -> 
             case.range_bits,
             dp_bits,
             num_k,
+            "both".to_string(),
         )?;
 
         let t0 = Instant::now();
