@@ -792,8 +792,11 @@ fn run_single_gpu_solver(
         // but larger dispatches accumulate more DPs. Subtract log2(steps) bits.
         // steps_per_call=512 → subtract 9 bits.
         let steps_penalty: u32 = 9;
-        let auto_dp =
-            (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak).saturating_add(steps_penalty));
+        let auto_dp = (effective_range / 2).saturating_sub(
+            density_penalty
+                .saturating_add(density_tweak)
+                .saturating_add(steps_penalty),
+        );
         auto_dp.clamp(8, 40)
     });
 
@@ -813,9 +816,15 @@ fn run_single_gpu_solver(
             c.base_point,
             args.mode.clone(),
         )?,
-        None => {
-            solver::KangarooSolver::new(gpu_context, pubkey, start, range_bits, dp_bits, num_k, args.mode.clone())?
-        }
+        None => solver::KangarooSolver::new(
+            gpu_context,
+            pubkey,
+            start,
+            range_bits,
+            dp_bits,
+            num_k,
+            args.mode.clone(),
+        )?,
     };
 
     let expected_ops = 1u128
@@ -867,12 +876,12 @@ fn run_single_gpu_solver(
                 // x: convert [u32;8] LE limbs to 32-byte BE
                 for (i, limb) in dp.x.iter().enumerate() {
                     let bytes = limb.to_le_bytes();
-                    record[28 - i*4..32 - i*4].copy_from_slice(&bytes);
+                    record[28 - i * 4..32 - i * 4].copy_from_slice(&bytes);
                 }
                 // dist: convert [u32;8] LE limbs to 32-byte BE
                 for (i, limb) in dp.dist.iter().enumerate() {
                     let bytes = limb.to_le_bytes();
-                    record[60 - i*4..64 - i*4].copy_from_slice(&bytes);
+                    record[60 - i * 4..64 - i * 4].copy_from_slice(&bytes);
                 }
                 record[64] = dp.ktype as u8;
                 record[65] = dp_bits as u8;
@@ -1314,10 +1323,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut solvers = Vec::with_capacity(gpu_contexts.len());
     let mut kangaroo_offset = 0u32;
-    for ((gpu_index, ctx, _, _), per_gpu_k) in gpu_contexts
-        .into_iter()
-        .zip(per_gpu_k_allocation.into_iter())
-    {
+    for ((gpu_index, ctx, _, _), per_gpu_k) in gpu_contexts.into_iter().zip(per_gpu_k_allocation) {
         let solver = solver::KangarooSolver::new_with_base_no_dp_table(
             ctx,
             solve_pubkey,

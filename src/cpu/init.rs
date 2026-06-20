@@ -80,6 +80,7 @@ fn make_step_scalar_bytes(index: u32, exp_bits: u32, salt: u32) -> [u8; 32] {
 ///
 /// All range/offset math uses full 256-bit arithmetic to correctly handle
 /// range_bits >= 128 (fixes silent degradation from u128 clamping).
+#[allow(clippy::too_many_arguments)]
 pub fn initialize_kangaroos(
     pubkey: &Point,
     start: &U256,
@@ -139,11 +140,16 @@ pub fn initialize_kangaroos(
         .into_par_iter()
         .map(|i| {
             let ktype = match mode {
-                "tame" => 0,  // all tame
+                "tame" => 0, // all tame
                 "wild" => {
-                    if i < num_kangaroos / 2 { 1 } else { 2 }  // half wild_1, half wild_2
-                },
-                _ => {  // "both" - original behavior
+                    if i < num_kangaroos / 2 {
+                        1
+                    } else {
+                        2
+                    } // half wild_1, half wild_2
+                }
+                _ => {
+                    // "both" - original behavior
                     if i < one_third {
                         0 // tame
                     } else if i < 2 * one_third {
@@ -405,8 +411,16 @@ mod tests {
         let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
-        let result =
-            initialize_kangaroos(&pubkey, &start, 20, 2, &ProjectivePoint::GENERATOR, 0, 2, "both");
+        let result = initialize_kangaroos(
+            &pubkey,
+            &start,
+            20,
+            2,
+            &ProjectivePoint::GENERATOR,
+            0,
+            2,
+            "both",
+        );
         assert!(result.is_err(), "Should fail for num_kangaroos < 3");
         assert!(result.unwrap_err().to_string().contains("at least 3"));
     }
@@ -534,8 +548,16 @@ mod tests {
         let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
-        let result =
-            initialize_kangaroos(&pubkey, &start, 256, 6, &ProjectivePoint::GENERATOR, 0, 6, "both");
+        let result = initialize_kangaroos(
+            &pubkey,
+            &start,
+            256,
+            6,
+            &ProjectivePoint::GENERATOR,
+            0,
+            6,
+            "both",
+        );
         assert!(result.is_err());
     }
 
@@ -545,7 +567,16 @@ mod tests {
         let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
         let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
         let start = [0u8; 32];
-        let result = initialize_kangaroos(&pubkey, &start, 0, 6, &ProjectivePoint::GENERATOR, 0, 6, "both");
+        let result = initialize_kangaroos(
+            &pubkey,
+            &start,
+            0,
+            6,
+            &ProjectivePoint::GENERATOR,
+            0,
+            6,
+            "both",
+        );
         assert!(result.is_err());
     }
 

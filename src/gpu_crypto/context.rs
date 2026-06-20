@@ -436,9 +436,16 @@ impl GpuContext {
     }
 
     /// Create a shader module from pre-compiled SPIR-V bytes (passthrough to driver)
-    pub fn create_shader_module_spirv(&self, label: &str, spirv_bytes: &[u8]) -> wgpu::ShaderModule {
+    pub fn create_shader_module_spirv(
+        &self,
+        label: &str,
+        spirv_bytes: &[u8],
+    ) -> wgpu::ShaderModule {
         // Convert bytes to u32 words
-        assert!(spirv_bytes.len() % 4 == 0, "SPIR-V must be 4-byte aligned");
+        assert!(
+            spirv_bytes.len().is_multiple_of(4),
+            "SPIR-V must be 4-byte aligned"
+        );
         let spirv_words: Vec<u32> = spirv_bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))

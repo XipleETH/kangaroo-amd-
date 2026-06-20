@@ -10,7 +10,6 @@ use crate::gpu::{
     JumpTableData, KangarooPipeline, NormalizePipeline, WorkgroupVariant,
 };
 use anyhow::{anyhow, ensure, Result};
-use k256::elliptic_curve::Field;
 use k256::ProjectivePoint;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -20,7 +19,6 @@ use tracing::info;
 /// multi-GPU shutdown and avoid indefinite hangs on wedged drivers.
 const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
-const MAX_DISTINGUISHED_POINTS: u32 = 16_777_216;
 /// GPU-side DP buffer only needs to hold DPs from a single dispatch (at most num_kangaroos)
 const GPU_DP_BUFFER_SIZE: u32 = 65_536;
 const JUMP_TABLE_SIZE: u32 = 256;
@@ -96,6 +94,7 @@ impl KangarooSolver {
     ///
     /// Used for modular constraint search where H = M*G replaces G.
     /// The pubkey and start should already be the transformed values (Q, j_start).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_base(
         ctx: GpuContext,
         pubkey: Point,
@@ -361,7 +360,10 @@ impl KangarooSolver {
                     Some(np)
                 }
                 Err(e) => {
-                    info!("GPU normalization pipeline failed ({}), falling back to CPU", e);
+                    info!(
+                        "GPU normalization pipeline failed ({}), falling back to CPU",
+                        e
+                    );
                     None
                 }
             }
@@ -537,18 +539,24 @@ impl KangarooSolver {
         use rayon::prelude::*;
 
         // Wait for GPU to finish
-        self.ctx.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(GPU_POLL_TIMEOUT),
-        }).map_err(|e| anyhow!("GPU poll failed during normalize: {e:?}"))?;
+        self.ctx
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(GPU_POLL_TIMEOUT),
+            })
+            .map_err(|e| anyhow!("GPU poll failed during normalize: {e:?}"))?;
 
         // Read kangaroos from GPU
         let kangaroo_size = std::mem::size_of::<GpuKangaroo>();
         let total_size = (self.num_kangaroos as usize) * kangaroo_size;
 
-        let mut encoder = self.ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("Normalize Encoder") }
-        );
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Normalize Encoder"),
+            });
         encoder.copy_buffer_to_buffer(
             &self.buffers.kangaroos_buffer,
             0,
@@ -561,11 +569,16 @@ impl KangarooSolver {
         let staging = self.buffers.staging_buffer(0);
         let slice = staging.slice(0..total_size as u64);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
-        self.ctx.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(sub),
-            timeout: Some(GPU_POLL_TIMEOUT),
-        }).map_err(|e| anyhow!("GPU poll failed reading kangaroos: {e:?}"))?;
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.ctx
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(sub),
+                timeout: Some(GPU_POLL_TIMEOUT),
+            })
+            .map_err(|e| anyhow!("GPU poll failed reading kangaroos: {e:?}"))?;
         rx.recv_timeout(GPU_POLL_TIMEOUT)
             .map_err(|e| anyhow!("Kangaroo readback timeout: {e}"))?
             .map_err(|e| anyhow!("Kangaroo map failed: {e:?}"))?;
@@ -583,13 +596,20 @@ impl KangarooSolver {
         let dp_meta = Self::dp_meta(self.dp_bits_stored);
 
         // ── Phase 1: Convert Z limbs → FieldElements (parallel) ──
-        let z_fes: Vec<_> = kangaroos.par_iter()
+        let z_fes: Vec<_> = kangaroos
+            .par_iter()
             .map(|k| {
-                if k.is_active == 0 { return None; }
+                if k.is_active == 0 {
+                    return None;
+                }
                 let z_is_one = k.z[0] == 1 && k.z[1..].iter().all(|&v| v == 0);
-                if z_is_one { return None; }
+                if z_is_one {
+                    return None;
+                }
                 let z_fe = limbs_to_field_element(&k.z);
-                if bool::from(z_fe.is_zero()) { return None; }
+                if bool::from(z_fe.is_zero()) {
+                    return None;
+                }
                 Some(z_fe)
             })
             .collect();
@@ -620,7 +640,7 @@ impl KangarooSolver {
             let mut inverses = vec![k256::FieldElement::ZERO; m];
             for j in (1..m).rev() {
                 inverses[j] = inv_acc * products[j - 1];
-                inv_acc = inv_acc * need_inv[j].1;
+                inv_acc *= need_inv[j].1;
             }
             inverses[0] = inv_acc;
             inverses
@@ -634,17 +654,24 @@ impl KangarooSolver {
         }
 
         // Parallel normalize + DP check
-        let results: Vec<_> = kangaroos.par_iter_mut().enumerate()
+        let results: Vec<_> = kangaroos
+            .par_iter_mut()
+            .enumerate()
             .filter_map(|(i, k)| {
-                if k.is_active == 0 { return None; }
+                if k.is_active == 0 {
+                    return None;
+                }
 
                 // If Z was already 1, just check DP
                 if z_fes[i].is_none() {
                     let z_is_one = k.z[0] == 1 && k.z[1..].iter().all(|&v| v == 0);
                     if z_is_one && Self::is_dp_cpu(&k.x, &dp_meta) {
                         return Some(GpuDistinguishedPoint {
-                            x: k.x, dist: k.dist, ktype: k.ktype,
-                            kangaroo_id: i as u32, _padding: [0; 6],
+                            x: k.x,
+                            dist: k.dist,
+                            ktype: k.ktype,
+                            kangaroo_id: i as u32,
+                            _padding: [0; 6],
                         });
                     }
                     return None;
@@ -664,8 +691,11 @@ impl KangarooSolver {
 
                     if Self::is_dp_cpu(&k.x, &dp_meta) {
                         return Some(GpuDistinguishedPoint {
-                            x: k.x, dist: k.dist, ktype: k.ktype,
-                            kangaroo_id: i as u32, _padding: [0; 6],
+                            x: k.x,
+                            dist: k.dist,
+                            ktype: k.ktype,
+                            kangaroo_id: i as u32,
+                            _padding: [0; 6],
                         });
                     }
                 }
@@ -683,7 +713,8 @@ impl KangarooSolver {
         if self.total_ops % 50_000_000 < (self.num_kangaroos as u64 * self.steps_per_call as u64) {
             tracing::info!(
                 "Normalize: batch_inv={}, dps_found={}",
-                need_inv.len(), results.len()
+                need_inv.len(),
+                results.len()
             );
         }
 
@@ -693,8 +724,10 @@ impl KangarooSolver {
     /// CPU-side DP check using dp_meta
     fn is_dp_cpu(x: &[u32; 8], dp_meta: &[u32; 4]) -> bool {
         let full_limbs = dp_meta[0].min(8) as usize;
-        for i in 0..full_limbs {
-            if x[i] != 0 { return false; }
+        for item in x.iter().take(full_limbs) {
+            if *item != 0 {
+                return false;
+            }
         }
         let partial_mask = dp_meta[1];
         if partial_mask == 0 || full_limbs >= 8 {
@@ -735,7 +768,7 @@ impl KangarooSolver {
 
         if let Some(dp_table) = self.dp_table.as_mut() {
             for dp in &dps {
-                if let Some(key) = dp_table.insert_and_check(dp.clone()) {
+                if let Some(key) = dp_table.insert_and_check(*dp) {
                     self.last_dps = dps;
                     return Ok(Some(key));
                 }
@@ -860,10 +893,14 @@ impl KangarooSolver {
                 // So steps_per_call doesn't affect DP rate — only walk throughput!
                 // Use maximum steps for maximum GPU utilization.
                 self.steps_per_call = 512;
-                let expected_dps_per_dispatch = (self.num_kangaroos as f64) / (2.0_f64.powi(dp_bits as i32));
+                let expected_dps_per_dispatch =
+                    (self.num_kangaroos as f64) / (2.0_f64.powi(dp_bits as i32));
                 if verbose {
                     info!("Using steps_per_call=512 with GPU normalization");
-                    info!("Expected DPs/dispatch: {:.4} (dp_bits={})", expected_dps_per_dispatch, dp_bits);
+                    info!(
+                        "Expected DPs/dispatch: {:.4} (dp_bits={})",
+                        expected_dps_per_dispatch, dp_bits
+                    );
                 }
             } else {
                 // CPU normalization fallback: use low steps to reduce CPU readback cost
@@ -881,12 +918,8 @@ impl KangarooSolver {
 
         for &steps in &candidates {
             // Check DP buffer constraint first
-            let max_steps = Self::select_steps_per_call(
-                steps,
-                self.num_kangaroos,
-                dp_bits,
-                GPU_DP_BUFFER_SIZE,
-            );
+            let max_steps =
+                Self::select_steps_per_call(steps, self.num_kangaroos, dp_bits, GPU_DP_BUFFER_SIZE);
             if max_steps < steps {
                 // Would overflow DP buffer, stop here
                 break;
@@ -1047,7 +1080,7 @@ impl KangarooSolver {
             let mut inverses = vec![k256::FieldElement::ZERO; m];
             for j in (1..m).rev() {
                 inverses[j] = inv_acc * products[j - 1];
-                inv_acc = inv_acc * need_inv[j].1;
+                inv_acc *= need_inv[j].1;
             }
             inverses[0] = inv_acc;
             inverses
@@ -1125,9 +1158,9 @@ fn limbs_to_field_element(limbs: &[u32; 8]) -> k256::FieldElement {
 fn field_element_to_limbs(fe: &k256::FieldElement) -> [u32; 8] {
     let be_bytes = fe.to_bytes();
     let mut limbs = [0u32; 8];
-    for i in 0..8 {
+    for (i, limb) in limbs.iter_mut().enumerate() {
         let be_start = 28 - i * 4;
-        limbs[i] = u32::from_be_bytes([
+        *limb = u32::from_be_bytes([
             be_bytes[be_start],
             be_bytes[be_start + 1],
             be_bytes[be_start + 2],
@@ -1144,22 +1177,20 @@ mod tests {
     #[test]
     fn caps_steps_when_dp_buffer_would_overflow() {
         // With dense DPs (8 bits) and many kangaroos, a large steps_per_call would overflow the DP buffer.
-        let steps =
-            KangarooSolver::select_steps_per_call(4_096, 16_384, 8, GPU_DP_BUFFER_SIZE);
+        let steps = KangarooSolver::select_steps_per_call(4_096, 16_384, 8, GPU_DP_BUFFER_SIZE);
         assert!(steps < 4_096, "steps {} should be capped below 4096", steps);
     }
 
     #[test]
     fn keeps_optimal_when_within_budget() {
         // Higher DP bits reduce DP density; we should keep the GPU-optimal step count.
-        let steps =
-            KangarooSolver::select_steps_per_call(4_096, 4_096, 16, GPU_DP_BUFFER_SIZE);
+        let steps = KangarooSolver::select_steps_per_call(4_096, 4_096, 16, GPU_DP_BUFFER_SIZE);
         assert_eq!(steps, 4_096);
     }
 
     #[test]
     fn limbs_roundtrip() {
-        use super::{limbs_to_field_element, field_element_to_limbs};
+        use super::{field_element_to_limbs, limbs_to_field_element};
         // Test with value 1
         let one_limbs: [u32; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
         let fe = limbs_to_field_element(&one_limbs);

@@ -3,9 +3,7 @@
 //! Uses double-buffered DP slots so the CPU can read back results from
 //! the previous dispatch while the GPU is already executing the next one.
 
-use super::{
-    GpuAffinePoint, GpuConfig, GpuContext, GpuDpCandidate, GpuKangaroo, KangarooPipeline,
-};
+use super::{GpuAffinePoint, GpuConfig, GpuContext, GpuDpCandidate, GpuKangaroo, KangarooPipeline};
 use anyhow::Result;
 use wgpu::{BindGroup, Buffer, BufferUsages};
 

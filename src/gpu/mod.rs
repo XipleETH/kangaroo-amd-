@@ -58,4 +58,3 @@ pub struct GpuDpCandidate {
 }
 
 const _: [(); 160] = [(); core::mem::size_of::<GpuKangaroo>()];
-

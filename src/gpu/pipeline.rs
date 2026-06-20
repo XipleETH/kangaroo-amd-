@@ -8,6 +8,7 @@ use tracing::info;
 use wgpu::{BindGroupLayout, ComputePipeline};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
 pub enum WorkgroupVariant {
     Wg64,
     Wg128,
@@ -59,7 +60,8 @@ impl KangarooPipeline {
         let constants = [("WORKGROUP_SIZE", variant.size() as f64)];
 
         info!("Creating shader module...");
-        let shader = ctx.create_shader_module("Kangaroo Jacobian Shader", &[field, curve, kangaroo]);
+        let shader =
+            ctx.create_shader_module("Kangaroo Jacobian Shader", &[field, curve, kangaroo]);
         info!("Shader module created");
 
         info!("Creating bind group layout...");
@@ -187,6 +189,7 @@ impl KangarooPipeline {
 #[derive(Clone)]
 pub struct NormalizePipeline {
     pub pipeline: Arc<ComputePipeline>,
+    #[allow(dead_code)]
     pub bind_group_layout: Arc<BindGroupLayout>,
 }
 
