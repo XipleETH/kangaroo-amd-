@@ -5,3 +5,11 @@
 
 # Skilld references (recreated by `skilld install`)
 .skilld
+
+# Build artifacts
+dp_output.bin
+dp_test*.bin
+*.spv
+combined_shader.wgsl
+context7.json
+AGENTS.md

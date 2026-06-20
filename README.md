@@ -1,256 +1,206 @@
-# Kangaroo
+# 🦘 Kangaroo-AMD
 
-[![Crates.io](https://img.shields.io/crates/v/kangaroo?style=flat&colorA=130f40&colorB=474787)](https://crates.io/crates/kangaroo)
-[![Downloads](https://img.shields.io/crates/d/kangaroo?style=flat&colorA=130f40&colorB=474787)](https://crates.io/crates/kangaroo)
-[![License](https://img.shields.io/crates/l/kangaroo?style=flat&colorA=130f40&colorB=474787)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/oritwoen/kangaroo)
+**GPU-accelerated Pollard's Kangaroo solver for the Elliptic Curve Discrete Logarithm Problem (ECDLP) on secp256k1 — with AMD GPU support.**
 
-GPU-accelerated Pollard's Kangaroo algorithm for solving the Elliptic Curve Discrete Logarithm Problem (ECDLP) on secp256k1.
+> Fork of [oritwoen/kangaroo](https://github.com/oritwoen/kangaroo) by [XipleETH](https://github.com/XipleETH/kangaroo-amd-)
 
-## Features
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- 🖥️ **Cross-platform GPU** — Vulkan (AMD, NVIDIA, Intel), Metal (Apple Silicon), DX12 (Windows) via wgpu
-- 🦀 **Pure Rust + WGSL** — no CUDA dependency, compute shaders compiled at runtime
-- ⚡ **Distinguished Points** — efficient collision detection with auto-tuned DP bits
-- 🔄 **Negation map** — ~1.29× speedup via Y-parity directed walks with cycle guards
-- 🦘 **Multi-set kangaroos** — tame, wild1, wild2 herds for higher collision probability
-- 🎯 **Modular constraints** — if k ≡ R (mod M), reduce search space by factor M
-- ⚙️ **Auto-calibration** — GPU dispatch timing and workgroup size tuned at startup
-- 📊 **Built-in benchmarks** — `--benchmark` to test hardware, `--save-benchmarks` to record results
-- 📦 **Data providers** — pluggable puzzle sources (boha integration for Bitcoin puzzles)
-- 💻 **CPU fallback** — pure CPU solver for testing and comparison
+---
 
-## Why This Project?
+## What is this?
 
-Most existing Kangaroo implementations (JeanLucPons/Kangaroo, RCKangaroo, etc.) only support NVIDIA GPUs via CUDA. This implementation uses WebGPU/wgpu which provides cross-platform GPU compute through Vulkan, Metal, and DX12.
+The original kangaroo project only supported NVIDIA GPUs. This fork adds **AMD GPU support** (tested on RDNA3 / RX 7800 XT) using [wgpu](https://wgpu.rs/) (WebGPU) for cross-platform GPU compute via Vulkan and DX12.
 
-## Installation
+### Key features
 
-### Arch Linux (AUR)
+- **Two-pass GPU pipeline** optimized for AMD shader compilers
+  - *Walk shader* — Jacobian coordinates, no `fe_inv` (avoids RDNA3 compiler hangs)
+  - *Normalize shader* — field inversion + exact DP detection in a separate, simpler pass
+- **~560M ops/s** on AMD Radeon RX 7800 XT
+- **Pool bridge** for [Collision Protocol](https://collisionprotocol.com) mining
+- **CPU fallback** for systems without a compatible GPU
+- Double-buffered GPU pipeline for maximum throughput
 
-```bash
-paru -S kangaroo
+---
+
+## Quick Start
+
+### 1. Local Solo Mode (default)
+
+Run the solver independently to find a private key.
+
+```
+kangaroo.exe --pubkey <COMPRESSED_PUBKEY> --range <BITS> --dp-bits <DP_BITS>
 ```
 
-### Cargo
+**Example — Bitcoin Puzzle #40:**
 
-```bash
-cargo install kangaroo
+```
+kangaroo.exe --pubkey 03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4 --range 40 --dp-bits 10 --kangaroos 65536
 ```
 
-### From source
+### 2. Pool Mode (Collision Protocol)
 
-```bash
-git clone https://github.com/oritwoen/kangaroo
-cd kangaroo
-cargo build --release
+Connect to the [Collision Protocol](https://collisionprotocol.com) pool to contribute work alongside other miners. Requires two processes: the solver writing DPs to a file, and the Python bridge submitting them to the pool.
+
+**Step 1 — Start the bridge:**
+
+```
+python bridge/pool_bridge.py --worker YOUR_BTC_ADDRESS --dp-file dp_output.bin
 ```
 
-### With boha provider
+**Step 2 — Start the solver:**
 
-```bash
-cargo build --release --features boha
+```
+kangaroo.exe --pubkey <POOL_PUBKEY> --range 135 --kangaroos 65536 --dp-bits 28 --mode wild --dp-output dp_output.bin
 ```
 
-## Usage
+Or use the batch script: **`run_pool.bat`** (edit your wallet address first).
 
-```bash
-kangaroo --pubkey <PUBKEY> --start <START> --range <BITS>
+### 3. CPU Mode (no GPU needed)
+
+```
+kangaroo.exe --pubkey <PUBKEY> --range <BITS> --cpu
 ```
 
-### Arguments
+---
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `-t, --target` | - | Data provider target (e.g., `boha:b1000/135`) |
-| `-p, --pubkey` | - | Target public key (compressed hex, 33 bytes) |
-| `-s, --start` | 0 | Start of search range (hex, without 0x prefix) |
-| `-r, --range` | 32 | Search range in bits (key is in [start, start + 2^range - 1]) |
-| `-d, --dp-bits` | auto | Distinguished point bits |
+## CLI Reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `-p, --pubkey` | *required* | Target public key (compressed hex, 33 bytes) |
+| `-r, --range` | *required* | Bit range to search |
+| `-s, --start` | auto | Start of search range (hex) |
+| `-d, --dp-bits` | auto | Distinguished point bits (lower = more DPs, more memory) |
 | `-k, --kangaroos` | auto | Number of parallel kangaroos |
-| `--gpu` | 0 | GPU device index |
-| `--backend` | auto | GPU backend: `auto`, `vulkan`, `dx12`, `metal`, `gl` |
-| `-o, --output` | - | Output file for result |
-| `-q, --quiet` | false | Minimal output, just print found key |
-| `--max-ops` | 0 | Max operations (0 = unlimited) |
-| `--cpu` | false | Use CPU solver instead of GPU |
-| `--json` | false | Output benchmark results in JSON format |
-| `--benchmark` | false | Run benchmark suite |
-| `--save-benchmarks` | false | Save benchmark results to `BENCHMARKS.md` when `--benchmark` is used |
-| `--mod-step` | 1 | Modular step M (hex): search only k ≡ R (mod M) |
-| `--mod-start` | 0 | Modular residue R (hex): 0 ≤ R < M |
-| `--list-providers` | false | List available puzzles from providers |
+| `--mode` | `both` | Kangaroo mode: `both` (solo), `tame`, or `wild` (pool) |
+| `--dp-output` | — | Write DPs to binary file (for pool bridge) |
+| `--gpu` | `0` | GPU index, comma-separated, or `all` |
+| `--list-gpus` | | List available GPU devices |
+| `--backend` | `auto` | GPU backend: `auto` / `vulkan` / `dx12` / `metal` / `gl` |
+| `--cpu` | `false` | Use CPU solver instead of GPU |
+| `-o, --output` | — | Output file for found key |
+| `-q, --quiet` | `false` | Minimal output |
+| `--max-ops` | unlimited | Maximum operations before stopping |
+| `-t, --target` | — | Data provider (e.g. `boha:b1000/135`) |
+| `--list-providers` | | List available puzzle providers |
+| `--benchmark` | `false` | Run benchmark suite |
 
-Either `--target` or `--pubkey` is required.
-
-### Examples
-
-**Using data provider (boha):**
-
-```bash
-# Solve puzzle using boha data (auto: pubkey, start, range)
-kangaroo --target boha:b1000/66
-
-# Override range (search smaller subset)
-kangaroo --target boha:b1000/66 --range 60
-
-# List available puzzles
-kangaroo --list-providers
-```
-
-**Manual parameters:**
-
-```bash
-kangaroo \
-    --pubkey 03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4 \
-    --start 8000000000 \
-    --range 40
-```
-
-**With modular constraint (k ≡ 37 mod 60):**
-
-```bash
-kangaroo \
-    --pubkey 03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4 \
-    --start 8000000000 \
-    --range 40 \
-    --mod-step 3c \
-    --mod-start 25
-```
-
-This reduces the search space by ~60×. Useful when partial key structure is known (e.g., key generated with a predictable step pattern).
-
-## How It Works
-
-The Pollard's Kangaroo algorithm solves the discrete logarithm problem in O(√n) time where n is the search range. It works by:
-
-1. **Tame kangaroos** start from a known point and make random jumps
-2. **Wild kangaroos** start from the target public key and make the same type of jumps
-3. When a wild and tame kangaroo land on the same point (collision), we can compute the private key
-
-**Distinguished Points (DP)** optimization: Instead of storing all visited points, we only store points whose x-coordinate has a specific number of leading zero bits. This dramatically reduces memory usage while still allowing collision detection.
-
-## Performance
-
-Expected operations: ~2^(range_bits/2)
-
-Run `kangaroo --benchmark` to test your hardware without touching files. Use `kangaroo --benchmark --save-benchmarks` to update [BENCHMARKS.md](BENCHMARKS.md).
-
-## Use Cases
-
-| Use Case | Example |
-|----------|---------|
-| Partial key decoded | Puzzle gives ~240 bits, need to find remaining ~16 |
-| Key in known range | Know key is between X and Y |
-| Verify near-solution | Have candidate, search ±N bits around it |
-
-**NOT useful for:**
-- Full 256-bit key search (mathematically impossible)
-- BIP39 passphrase brute-force (use dictionary attack instead)
-- Puzzles without partial key information
-
-## Library Usage
-
-```rust
-use kangaroo::{KangarooSolver, GpuContext, GpuBackend, parse_pubkey, parse_hex_u256, verify_key};
-
-fn main() -> anyhow::Result<()> {
-    let pubkey = parse_pubkey("03...")?;
-    let start = parse_hex_u256("8000000000")?;
-
-    let ctx = pollster::block_on(GpuContext::new(0, GpuBackend::Auto))?;
-    let mut solver = KangarooSolver::new(
-        ctx,
-        pubkey.clone(),
-        start,
-        40,  // range_bits
-        12,  // dp_bits
-        1024, // num_kangaroos
-    )?;
-
-    loop {
-        if let Some(key) = solver.step()? {
-            if verify_key(&key, &pubkey) {
-                println!("Found: {}", hex::encode(&key));
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-```
-
-## Data Providers
-
-Kangaroo supports external data providers for puzzle sources. Providers supply pubkey, key range, and other puzzle metadata.
-
-### boha (optional feature)
-
-[boha](https://github.com/oritwoen/boha) provides crypto puzzle data including Bitcoin Puzzle Transaction (b1000).
-
-Build with boha support:
-```bash
-cargo build --release --features boha
-```
-
-Usage:
-```bash
-# Solve specific puzzle
-kangaroo --target boha:b1000/66
-
-# List solvable puzzles (unsolved with known pubkey)
-kangaroo --list-providers
-```
-
-Provider validates range overrides - you cannot search outside the puzzle's key range.
+---
 
 ## Architecture
 
+The solver uses a **two-pass GPU compute pipeline** designed to work around AMD RDNA3 shader compiler limitations:
+
 ```
-src/
-├── main.rs              # CLI entry point
-├── lib.rs               # Library entry + Args + run()
-├── solver.rs            # GPU solver coordination
-├── cli.rs               # CLI utilities (tracing, progress bar)
-├── benchmark.rs         # Built-in benchmark suite
-├── modular.rs           # Modular constraint transformation
-├── math.rs              # 256-bit arithmetic, DP mask generation
-├── convert.rs           # Limb/byte conversions for GPU↔CPU
-├── provider/
-│   ├── mod.rs           # Provider system interface
-│   └── boha.rs          # boha provider (feature-gated)
-├── cpu/
-│   ├── cpu_solver.rs    # Pure CPU solver (testing/comparison)
-│   ├── dp_table.rs      # Distinguished Points collision detection
-│   └── init.rs          # Kangaroo initialization + jump tables
-├── crypto/
-│   └── mod.rs           # k256/secp256k1 wrappers
-├── gpu/
-│   ├── pipeline.rs      # Compute pipeline setup
-│   └── buffers.rs       # GPU buffer management
-├── gpu_crypto/
-│   ├── context.rs       # GPU context + backend selection
-│   └── shaders/         # WGSL shader library
-│       ├── field.wgsl   # secp256k1 field arithmetic
-│       └── curve.wgsl   # Jacobian point operations
-└── shaders/
-    └── kangaroo_affine.wgsl  # Main Kangaroo compute shader
+┌─────────────────────────────────────────────────────────────────┐
+│  GPU Slot N                          GPU Slot N-1               │
+│  ┌──────────────────┐                ┌──────────────────┐       │
+│  │  1. Walk Shader  │  dispatch      │  Read back DPs   │       │
+│  │  (Jacobian, no   │◄──────────►    │  from previous   │       │
+│  │   fe_inv)        │                │  dispatch         │       │
+│  └────────┬─────────┘                └──────────────────┘       │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌──────────────────┐                                           │
+│  │  2. Normalize    │                                           │
+│  │  Shader (fe_inv  │                                           │
+│  │  + DP detection) │                                           │
+│  └──────────────────┘                                           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Requirements
+1. **Walk Shader** (`kangaroo_jacobian.wgsl`) — Performs N steps of the kangaroo walk in Jacobian coordinates. No field inversion needed, which avoids the complex `fe_inv` function that causes AMD RDNA3 shader compilers to hang.
 
-- Rust 1.70+
-- Vulkan-capable GPU (AMD, NVIDIA, Intel) or Metal (macOS)
-- On Linux with AMD RADV, Mesa 25.x or newer is required (older Mesa versions may crash on WGSL dynamic indexing in shader loops)
-- GPU drivers installed
+2. **Normalize Shader** (`normalize_dp.wgsl`) — Normalizes all kangaroos from Jacobian (X, Y, Z) to Affine (X/Z², Y/Z³) coordinates using `fe_inv`. Checks the exact DP condition on the affine X coordinate. This shader is simple enough to compile on AMD without issues.
+
+The pipeline is **double-buffered**: it dispatches walk + normalize on slot N while reading back results from slot N−1.
+
+---
+
+## Performance
+
+Tested on **AMD Radeon RX 7800 XT** (RDNA3):
+
+| Metric | Value |
+|---|---|
+| Throughput | **~560M ops/s** |
+| Kangaroos | 65,536 |
+| Steps per dispatch | 512 |
+| Workgroup size | 64 |
+
+### Bitcoin Puzzle Solving Times
+
+All results verified correct:
+
+| Puzzle | Bits | Time |
+|---|---|---|
+| #20 – #32 | 20–32 | < 3 s |
+| #33 – #37 | 33–37 | 5–15 s |
+| #38 – #42 | 38–42 | 38 s – 3 min |
+| #43 – #47 | 43–47 | 5–23 min |
+
+---
+
+## Building from Source
+
+### Prerequisites
+
+- **Rust 1.75+** — `rustup install stable`
+- **Vulkan SDK** or AMD GPU drivers with Vulkan support
+- **Python 3.8+** (for pool bridge only)
+
+### Build
+
+```bash
+git clone https://github.com/XipleETH/kangaroo-amd-.git
+cd kangaroo-amd-
+cargo build --release
+```
+
+The binary will be at:
+- **Windows:** `target/release/kangaroo.exe`
+- **Linux:** `target/release/kangaroo`
+
+> [!NOTE]
+> The GPU normalization shader takes **~46 seconds** to compile the first time on AMD. Subsequent runs use the driver's shader cache and start instantly.
+
+---
+
+## Pool Bridge
+
+The pool bridge (`bridge/pool_bridge.py`) connects to the Collision Protocol pool at `pool.collisionprotocol.com:17403` using TLS.
+
+- **Protocol:** JLP binary wire protocol v3
+- **No dependencies:** Uses only Python stdlib (`ssl`, `socket`, `struct`)
+
+### How it works
+
+1. Bridge authenticates with your Bitcoin address
+2. Pool assigns work (pubkey, range, dp_bits, kangaroo type)
+3. Solver writes DPs to a binary file as it finds them
+4. Bridge reads DPs and submits them to the pool
+5. If a collision is found, the pool distributes the reward
+
+---
+
+## Donations
+
+If you find this fork useful, donations are welcome:
+
+**BTC:** `bc1qxtyjnyszrsvcwndvzsx6ee7s7hm5sg8uzl8duq`
+
+---
+
+## Credits
+
+- **Original project:** [oritwoen/kangaroo](https://github.com/oritwoen/kangaroo)
+- **AMD GPU support, GPU normalization shader, and pool bridge:** [XipleETH](https://github.com/XipleETH)
+- Based on Pollard's Kangaroo algorithm for ECDLP
+- Pool: [Collision Protocol](https://collisionprotocol.com)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Related Projects
-
-- [JeanLucPons/Kangaroo](https://github.com/JeanLucPons/Kangaroo) - CUDA implementation (NVIDIA only)
-- [RCKangaroo](https://github.com/RetiredC/RCKangaroo) - CUDA implementation (NVIDIA only)
-- [boha](https://github.com/oritwoen/boha) - Crypto puzzles and bounties data library
+MIT License — see [LICENSE](LICENSE) for details.

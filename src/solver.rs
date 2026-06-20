@@ -7,7 +7,7 @@ use crate::cpu::DPTable;
 use crate::crypto::{Point, U256};
 use crate::gpu::{
     GpuBuffers, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuDpCandidate, GpuKangaroo,
-    JumpTableData, KangarooPipeline, WorkgroupVariant,
+    JumpTableData, KangarooPipeline, NormalizePipeline, WorkgroupVariant,
 };
 use anyhow::{anyhow, ensure, Result};
 use k256::elliptic_curve::Field;
@@ -40,6 +40,7 @@ struct JumpTableRefs<'a> {
 pub struct KangarooSolver {
     ctx: GpuContext,
     pipeline: KangarooPipeline,
+    normalize_pipeline: Option<NormalizePipeline>,
     buffers: GpuBuffers,
     dp_table: Option<DPTable>,
     total_ops: u64,
@@ -348,9 +349,28 @@ impl KangarooSolver {
         upload_kangaroos(&ctx, &buffers, &kangaroos)?;
 
         // Create solver instance
+        // Create normalization pipeline for exact DP detection (ALL modes).
+        // The Jacobian walk shader cannot detect DPs because X_jac = X_affine * Z²,
+        // so the approximate DP check on Jacobian X is unreliable.
+        // GPU normalization converts Z→1 and checks exact affine X.
+        let normalize_pipeline = {
+            info!("Creating GPU normalization pipeline...");
+            match NormalizePipeline::new(&ctx, pipeline.variant) {
+                Ok(np) => {
+                    info!("GPU normalization pipeline created! Full GPU DP detection enabled.");
+                    Some(np)
+                }
+                Err(e) => {
+                    info!("GPU normalization pipeline failed ({}), falling back to CPU", e);
+                    None
+                }
+            }
+        };
+
         let mut solver = Self {
             ctx,
             pipeline,
+            normalize_pipeline,
             buffers,
             dp_table: if with_dp_table {
                 Some(DPTable::new(start, pubkey, base_point))
@@ -414,14 +434,30 @@ impl KangarooSolver {
                 label: Some("Kangaroo Encoder"),
             });
 
+        let workgroups = self.num_kangaroos.div_ceil(self.workgroup_size);
+
+        // Pass 1: Jacobian walk (N steps, fast, no fe_inv)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Kangaroo Pass"),
+                label: Some("Kangaroo Walk Pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline.pipeline);
             pass.set_bind_group(0, self.buffers.bind_group(write_slot), &[]);
-            let workgroups = self.num_kangaroos.div_ceil(self.workgroup_size);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        // Pass 2: Normalize Jacobian→Affine + exact DP check (GPU-side)
+        if let Some(ref np) = self.normalize_pipeline {
+            // Clear dp_count before normalization (discard approximate DPs from walk)
+            encoder.clear_buffer(self.buffers.dp_count_buffer(write_slot), 0, None);
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Normalize DP Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&np.pipeline);
+            pass.set_bind_group(0, self.buffers.bind_group(write_slot), &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
@@ -671,13 +707,15 @@ impl KangarooSolver {
     pub fn step(&mut self) -> Result<Option<Vec<u8>>> {
         let (candidates, ops_delta) = self.step_collect()?;
 
-        // In pool mode, use full CPU normalization to catch ALL DPs
-        // (the Jacobian GPU shader doesn't write to the DP candidate buffer)
-        let dps = if self.mode != "both" {
+        // In pool mode with GPU normalization, candidates already have affine X (Z=1)
+        // In pool mode without GPU normalization, fall back to CPU normalization
+        // In solo mode, use approximate DP candidates from walk shader
+        let dps = if self.mode != "both" && self.normalize_pipeline.is_none() {
+            // Fallback: CPU normalization
             self.normalize_and_check_dps()?
         } else {
-            // Convert shader DP candidates to verified affine DPs
-            // (batch inversion of ~0-10 candidates, not 65K kangaroos)
+            // GPU normalization (pool) or approximate DPs (solo)
+            // Both cases: convert candidates to verified DPs
             self.convert_candidates_to_dps(candidates)?
         };
 
@@ -813,23 +851,25 @@ impl KangarooSolver {
         let dp_meta = Self::dp_meta(dp_bits);
 
         if self.workgroup_size == 64 && self.num_kangaroos <= 65_536 {
-            // For Jacobian kernel with CPU normalization, use moderate steps_per_call.
-            // Walk determinism is preserved: all kangaroos start each dispatch with Z=1
-            // (normalized by CPU), so two kangaroos at the same affine point follow
-            // identical paths for all N steps. We only check DPs at the end of each
-            // dispatch (after normalization), losing intermediate DPs, but this is
-            // more than compensated by the ~30x higher throughput.
-            // For pool mode (mode != "both"), use steps_per_call=1 to catch ALL DPs.
-            // For solo mode, use 512 for ~30x higher throughput (loses intermediate DPs).
-            if self.mode == "both" {
+            if self.normalize_pipeline.is_some() {
+                // GPU normalization: DPs are only checked once per dispatch (at the end).
+                // We lose intermediate DPs, so tune steps_per_call for good DP rate.
+                // Target: ~0.5 expected DPs per dispatch.
+                // Formula: expected_dps = num_kangaroos / 2^dp_bits (per dispatch, independent of steps)
+                // The normalize shader checks ALL kangaroos after the walk, regardless of steps.
+                // So steps_per_call doesn't affect DP rate — only walk throughput!
+                // Use maximum steps for maximum GPU utilization.
                 self.steps_per_call = 512;
+                let expected_dps_per_dispatch = (self.num_kangaroos as f64) / (2.0_f64.powi(dp_bits as i32));
                 if verbose {
-                    info!("Using steps_per_call=512 for Jacobian kernel (high throughput)");
+                    info!("Using steps_per_call=512 with GPU normalization");
+                    info!("Expected DPs/dispatch: {:.4} (dp_bits={})", expected_dps_per_dispatch, dp_bits);
                 }
             } else {
-                self.steps_per_call = 1;
+                // CPU normalization fallback: use low steps to reduce CPU readback cost
+                self.steps_per_call = 16;
                 if verbose {
-                    info!("Using steps_per_call=1 for pool mode (captures all DPs)");
+                    info!("Using steps_per_call=16 (CPU normalization fallback)");
                 }
             }
             return Ok(());
