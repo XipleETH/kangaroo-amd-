@@ -1,0 +1,6 @@
+*.exe
+*.obj
+*.o
+*.log
+compile_out.txt
+diag*.bat
