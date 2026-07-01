@@ -7,7 +7,7 @@ use crate::cpu::DPTable;
 use crate::crypto::{Point, U256};
 use crate::gpu::{
     GpuBuffers, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuKangaroo, JumpTableData,
-    KangarooPipeline, WorkgroupVariant,
+    KangarooPipeline, WorkgroupVariant, GROUP_N,
 };
 use anyhow::{anyhow, ensure, Result};
 use k256::ProjectivePoint;
@@ -21,9 +21,6 @@ const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MAX_DISTINGUISHED_POINTS: u32 = 65_536;
 const JUMP_TABLE_SIZE: u32 = 256;
-/// Kangaroos processed per GPU thread (per-thread sequential batch inversion).
-/// MUST match `GROUP_N` in src/shaders/kangaroo_affine.wgsl.
-const GROUP_N: u32 = 4;
 /// Target dispatch time in milliseconds for calibration.
 ///
 /// This is still comfortably below the multi-second GPU watchdog budgets on the

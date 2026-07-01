@@ -5,6 +5,7 @@
 
 use super::{
     GpuAffinePoint, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuKangaroo, KangarooPipeline,
+    GROUP_N,
 };
 use anyhow::Result;
 use wgpu::{BindGroup, Buffer, BufferUsages};
@@ -33,6 +34,8 @@ pub struct GpuBuffers {
     #[allow(dead_code)]
     jump_distances_buffer: Buffer,
     pub kangaroos_buffer: Buffer,
+    #[allow(dead_code)]
+    subp_scratch_buffer: Buffer,
     slots: [DpSlot; NUM_SLOTS],
 }
 
@@ -71,6 +74,17 @@ impl GpuBuffers {
             "Kangaroos Buffer",
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             num_kangaroos as u64,
+        )?;
+
+        // Prefix-product scratch: one array<u32,8> per (thread, group slot).
+        // num_threads = ceil(num_kangaroos / GROUP_N); shared across DP slots
+        // because GPU dispatches execute in submission order (never concurrent).
+        let num_threads = num_kangaroos.div_ceil(GROUP_N);
+        let scratch_count = (num_threads as u64) * (GROUP_N as u64);
+        let subp_scratch_buffer = ctx.create_buffer::<[u32; 8]>(
+            "Subp Scratch Buffer",
+            BufferUsages::STORAGE,
+            scratch_count.max(1),
         )?;
 
         let kangaroos_size = (num_kangaroos as usize) * std::mem::size_of::<GpuKangaroo>();
@@ -130,6 +144,10 @@ impl GpuBuffers {
                         binding: 5,
                         resource: dp_count_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: subp_scratch_buffer.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -148,6 +166,7 @@ impl GpuBuffers {
             jump_points_buffer,
             jump_distances_buffer,
             kangaroos_buffer,
+            subp_scratch_buffer,
             slots,
         })
     }

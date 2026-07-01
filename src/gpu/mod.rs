@@ -9,6 +9,11 @@ pub use pipeline::{KangarooPipeline, WorkgroupVariant};
 
 use bytemuck::{Pod, Zeroable};
 
+/// Kangaroos processed per GPU thread (per-thread sequential batch inversion).
+/// MUST match `GROUP_N` in src/shaders/kangaroo_affine.wgsl. Kept <= 32 (the
+/// shader's DP-seen bitmask is a single u32).
+pub const GROUP_N: u32 = 16;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuConfig {
