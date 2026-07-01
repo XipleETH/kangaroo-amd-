@@ -158,7 +158,9 @@ impl KangarooPipeline {
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &constants,
-                    zero_initialize_workgroup_memory: true,
+                    // Per-thread kangaroo kernel has NO var<workgroup> memory, so the
+                    // LDS zero-init prologue is pure overhead.
+                    zero_initialize_workgroup_memory: false,
                 },
                 cache: None,
             });

@@ -21,6 +21,9 @@ const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MAX_DISTINGUISHED_POINTS: u32 = 65_536;
 const JUMP_TABLE_SIZE: u32 = 256;
+/// Kangaroos processed per GPU thread (per-thread sequential batch inversion).
+/// MUST match `GROUP_N` in src/shaders/kangaroo_affine.wgsl.
+const GROUP_N: u32 = 4;
 /// Target dispatch time in milliseconds for calibration.
 ///
 /// This is still comfortably below the multi-second GPU watchdog budgets on the
@@ -407,7 +410,9 @@ impl KangarooSolver {
             });
             pass.set_pipeline(&self.pipeline.pipeline);
             pass.set_bind_group(0, self.buffers.bind_group(write_slot), &[]);
-            let workgroups = self.num_kangaroos.div_ceil(self.workgroup_size);
+            // Each thread walks GROUP_N kangaroos, so launch num_kangaroos/GROUP_N threads.
+            let threads = self.num_kangaroos.div_ceil(GROUP_N);
+            let workgroups = threads.div_ceil(self.workgroup_size);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
@@ -719,7 +724,9 @@ impl KangarooSolver {
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, buffers.bind_group(0), &[]);
-            let workgroups = num_kangaroos.div_ceil(workgroup_size);
+            // Each thread walks GROUP_N kangaroos, so launch num_kangaroos/GROUP_N threads.
+            let threads = num_kangaroos.div_ceil(GROUP_N);
+            let workgroups = threads.div_ceil(workgroup_size);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 

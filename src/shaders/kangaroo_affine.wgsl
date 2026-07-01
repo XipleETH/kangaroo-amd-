@@ -1,8 +1,16 @@
 // =============================================================================
-// Pollard's Kangaroo Algorithm - GPU Kernel (Affine Coordinates)
+// Pollard's Kangaroo Algorithm - GPU Kernel (Affine, PER-THREAD batch inversion)
 // =============================================================================
-// Uses affine coordinates with batch inversion for point addition
-// More efficient than Jacobian: fewer field operations, no Z coordinate
+// Each thread owns GROUP_N kangaroos and performs a purely SEQUENTIAL Montgomery
+// batch inversion (forward prefix products -> ONE fe_inv -> backward pass).
+// This eliminates ALL workgroup barriers and idle lanes of the old tree design:
+// every lane does a full fe_inv amortized over GROUP_N points, in parallel.
+//
+// Correctness is byte-for-byte equivalent to the previous tree kernel:
+//   - same jump selection (jump_index_from_x + anti-repeat + cycle escape)
+//   - same negation-map class representative (even-y) and distance sign flip
+//   - same per-point dx==0 guard (substitute 1 before folding into the product)
+//   - same DP timing (one DP per kangaroo per dispatch, pre-walk + post-jump)
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -16,7 +24,7 @@ struct Config {
     cycle_cap: u32
 }
 
-// Must match Rust GpuKangaroo struct layout!
+// Must match Rust GpuKangaroo struct layout (128 bytes)!
 struct Kangaroo {
     x: array<u32, 8>,
     y: array<u32, 8>,
@@ -30,6 +38,12 @@ struct Kangaroo {
 }
 
 const REPEAT_THRESHOLD: u32 = 3u;
+
+// Kangaroos processed per thread. Compile-time constant, fully unrolled below
+// (do NOT turn this into an override constant or a dynamically-indexed loop:
+//  the AMD SPIR-V compiler needs literal indices to keep group state in VGPRs).
+// MUST match `GROUP_N` in src/solver.rs.
+const GROUP_N: u32 = 4u;
 
 struct DistinguishedPoint {
     x: array<u32, 8>,
@@ -50,25 +64,21 @@ struct DistinguishedPoint {
 @group(0) @binding(4) var<storage, read_write> dp_buffer: array<DistinguishedPoint>;
 @group(0) @binding(5) var<storage, read_write> dp_count: atomic<u32>;
 
-// Shared memory for batch inversion (tree-based Montgomery's trick)
-// Product tree + saved right-child products for inverse propagation
-var<workgroup> shared_prod: array<array<u32, 8>, 128>;   // Product tree / individual inverses
-var<workgroup> shared_save: array<array<u32, 8>, 128>;   // Saved right-child products (127 entries used)
-
+// WORKGROUP_SIZE now only controls launch granularity (no shared memory, no barriers).
 override WORKGROUP_SIZE: u32 = 128u;
 
 // -----------------------------------------------------------------------------
-// Store distinguished point
+// Store distinguished point (from loose fields, so we don't keep a full
+// Kangaroo struct alive just to store the rare DP).
 // -----------------------------------------------------------------------------
 
-fn store_dp(k: Kangaroo, kangaroo_id: u32) {
+fn store_dp_fields(x: array<u32, 8>, dist: array<u32, 8>, ktype: u32, kangaroo_id: u32) {
     let idx = atomicAdd(&dp_count, 1u);
-
     if (idx < 65536u) {
         var dp: DistinguishedPoint;
-        dp.x = k.x;
-        dp.dist = k.dist;
-        dp.ktype = k.ktype;
+        dp.x = x;
+        dp.dist = dist;
+        dp.ktype = ktype;
         dp.kangaroo_id = kangaroo_id;
         dp._padding = array<u32, 6>(0u, 0u, 0u, 0u, 0u, 0u);
         dp_buffer[idx] = dp;
@@ -76,16 +86,9 @@ fn store_dp(k: Kangaroo, kangaroo_id: u32) {
 }
 
 // -----------------------------------------------------------------------------
-// Affine point addition: R = P + Q (both affine)
-// Returns (x3, y3) given (x1, y1), (x2, y2), and precomputed inv = 1/(x2-x1)
-// 
-// Formula:
-//   λ = (y2 - y1) * inv
-//   x3 = λ² - x1 - x2
-//   y3 = λ * (x1 - x3) - y1
-//
-// Cost: 2M + 1S (with precomputed inverse)
-// Compare to Jacobian mixed add: 8M + 4S
+// Affine point addition: R = P + Q with precomputed inv = 1/(x2-x1)
+//   λ = (y2 - y1) * inv ; x3 = λ² - x1 - x2 ; y3 = λ*(x1 - x3) - y1
+// Cost: 2M + 1S.
 // -----------------------------------------------------------------------------
 
 fn affine_add_with_inv(
@@ -95,18 +98,15 @@ fn affine_add_with_inv(
     y2: array<u32, 8>,
     dx_inv: array<u32, 8>
 ) -> AffinePoint {
-    // λ = (y2 - y1) / (x2 - x1) = (y2 - y1) * dx_inv
     let dy = fe_sub(y2, y1);
     let lambda = fe_mul(dy, dx_inv);
-    
-    // x3 = λ² - x1 - x2
+
     let lambda_sq = fe_square(lambda);
     let x3 = fe_sub(fe_sub(lambda_sq, x1), x2);
-    
-    // y3 = λ * (x1 - x3) - y1
+
     let x1_minus_x3 = fe_sub(x1, x3);
     let y3 = fe_sub(fe_mul(lambda, x1_minus_x3), y1);
-    
+
     var result: AffinePoint;
     result.x = x3;
     result.y = y3;
@@ -150,300 +150,320 @@ fn escape_index_from_state(px: array<u32, 8>, kid: u32, cycle_counter: u32, step
 }
 
 // -----------------------------------------------------------------------------
-// Main compute shader
+// PHASE A (per point): select the effective jump index (anti-repeat + cycle
+// escape, identical to the old kernel) and compute dx = jump.x - px.
+// Returns the FINAL jump index (after all adjustments) plus the mutated
+// cycle/repeat/last_jump state. dx==0 is replaced by 1 so it can never zero the
+// running batch product (guard flag returned separately).
+// -----------------------------------------------------------------------------
+
+struct PhaseA {
+    jidx: u32,
+    dx: array<u32, 8>,
+    dxwz: bool,
+    cyc: u32,
+    rep: u32,
+    lastj: u32,
+}
+
+fn phase_a(
+    px: array<u32, 8>,
+    valid: bool,
+    cyc_in: u32,
+    rep_in: u32,
+    lastj_in: u32,
+    step: u32,
+    kid: u32
+) -> PhaseA {
+    var eidx = jump_index_from_x(px);
+    var cyc = cyc_in;
+    var rep = rep_in;
+    var lastj = lastj_in;
+
+    if (valid) {
+        let in_cycle = (cyc > config.cycle_cap)
+            || ((rep & 0xFFFFu) > REPEAT_THRESHOLD);
+        if (in_cycle) {
+            eidx = escape_index_from_state(px, kid, cyc, step);
+            cyc = 0u;
+            rep = 0u;
+        } else {
+            if (eidx == lastj) {
+                eidx = (eidx + 1u) & 0xFFu;
+            }
+            lastj = eidx;
+        }
+    }
+
+    // Stash the FINAL index (after escape / anti-repeat) — dx and the add MUST
+    // both use this exact index.
+    var dx = fe_sub(jump_points[eidx].x, px);
+    var wz = fe_is_zero(dx);
+    if (wz) {
+        dx = fe_one();
+    }
+
+    var out: PhaseA;
+    out.jidx = eidx;
+    out.dx = dx;
+    out.dxwz = wz;
+    out.cyc = cyc;
+    out.rep = rep;
+    out.lastj = lastj;
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// PHASE B (per point): negation-map add using the recovered dx_inv, plus the
+// distance sign flip and cycle/repeat bookkeeping. Identical math to the old
+// kernel lines 401-429. Only runs when valid && !dxwz.
+// -----------------------------------------------------------------------------
+
+struct PhaseB {
+    px: array<u32, 8>,
+    py: array<u32, 8>,
+    dist: array<u32, 8>,
+    cyc: u32,
+    rep: u32,
+    moved: bool,
+}
+
+fn phase_b_add(
+    px: array<u32, 8>,
+    py: array<u32, 8>,
+    dist_in: array<u32, 8>,
+    cyc_in: u32,
+    rep_in: u32,
+    jidx: u32,
+    dx_inv: array<u32, 8>,
+    valid: bool,
+    dxwz: bool
+) -> PhaseB {
+    var out: PhaseB;
+    out.px = px;
+    out.py = py;
+    out.dist = dist_in;
+    out.cyc = cyc_in;
+    out.rep = rep_in;
+    out.moved = false;
+
+    if (valid && !dxwz) {
+        let jp = jump_points[jidx];
+        let jd = jump_distances[jidx];
+
+        let y_odd = (py[0] & 1u) != 0u;
+
+        // Class representative {P,-P} -> even-y. x unchanged, so dx_inv is valid.
+        var repr_y = py;
+        if (y_odd) {
+            repr_y = fe_sub(fe_zero(), py);
+        }
+
+        let r = affine_add_with_inv(px, repr_y, jp.x, jp.y, dx_inv);
+        out.px = r.x;
+        out.py = r.y;
+
+        if (y_odd) {
+            // (-dist) + jump == jump - dist  (mod 2^256)
+            out.dist = scalar_sub_256(jd, dist_in);
+        } else {
+            out.dist = scalar_add_256(dist_in, jd);
+        }
+
+        out.cyc = cyc_in + 1u;
+        let new_jump = r.x[0] & 0xFFFFu;
+        if (new_jump == (rep_in >> 16u)) {
+            let cnt = (rep_in & 0xFFFFu) + 1u;
+            out.rep = (new_jump << 16u) | cnt;
+        } else {
+            out.rep = (new_jump << 16u) | 1u;
+        }
+        out.moved = true;
+    }
+
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Main compute shader — one thread walks GROUP_N kangaroos (strided mapping).
 // -----------------------------------------------------------------------------
 
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invocation_id) local_id_vec: vec3<u32>) {
-    let kid = global_id.x;
-    let lid = local_id_vec.x;
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let t = global_id.x;
+    let num_threads = (config.num_kangaroos + GROUP_N - 1u) / GROUP_N;
 
-    // Load kangaroo state (if valid)
-    var k: Kangaroo;
-    var valid = false;
-    if (kid < config.num_kangaroos) {
-        k = kangaroos[kid];
-        if (k.is_active != 0u) {
-            valid = true;
-        }
+    // ---- Per-point state (constant-indexed arrays -> SROA to registers) ----
+    var kid: array<u32, 4>;
+    var valid: array<bool, 4>;
+    var dp_stored: array<bool, 4>;
+    var px: array<array<u32, 8>, 4>;
+    var py: array<array<u32, 8>, 4>;
+    var dist: array<array<u32, 8>, 4>;
+    var ktype: array<u32, 4>;
+    var cyc: array<u32, 4>;
+    var rep: array<u32, 4>;
+    var lastj: array<u32, 4>;
+
+    // ---- LOAD (strided: thread t owns kangaroos t, t+T, t+2T, t+3T) ----
+    // i = 0
+    kid[0] = t;
+    valid[0] = false; dp_stored[0] = false;
+    px[0] = fe_one(); py[0] = fe_one(); dist[0] = fe_zero();
+    ktype[0] = 0u; cyc[0] = 0u; rep[0] = 0u; lastj[0] = 0xFFFFFFFFu;
+    if (kid[0] < config.num_kangaroos) {
+        let kk = kangaroos[kid[0]];
+        ktype[0] = kk.ktype; dist[0] = kk.dist;
+        cyc[0] = kk.cycle_counter; rep[0] = kk.repeat_count; lastj[0] = kk.last_jump;
+        if (kk.is_active != 0u) { valid[0] = true; px[0] = kk.x; py[0] = kk.y; }
+    }
+    if (valid[0] && is_distinguished(px[0])) {
+        store_dp_fields(px[0], dist[0], ktype[0], kid[0]); dp_stored[0] = true;
+    }
+    // i = 1
+    kid[1] = t + num_threads;
+    valid[1] = false; dp_stored[1] = false;
+    px[1] = fe_one(); py[1] = fe_one(); dist[1] = fe_zero();
+    ktype[1] = 0u; cyc[1] = 0u; rep[1] = 0u; lastj[1] = 0xFFFFFFFFu;
+    if (kid[1] < config.num_kangaroos) {
+        let kk = kangaroos[kid[1]];
+        ktype[1] = kk.ktype; dist[1] = kk.dist;
+        cyc[1] = kk.cycle_counter; rep[1] = kk.repeat_count; lastj[1] = kk.last_jump;
+        if (kk.is_active != 0u) { valid[1] = true; px[1] = kk.x; py[1] = kk.y; }
+    }
+    if (valid[1] && is_distinguished(px[1])) {
+        store_dp_fields(px[1], dist[1], ktype[1], kid[1]); dp_stored[1] = true;
+    }
+    // i = 2
+    kid[2] = t + 2u * num_threads;
+    valid[2] = false; dp_stored[2] = false;
+    px[2] = fe_one(); py[2] = fe_one(); dist[2] = fe_zero();
+    ktype[2] = 0u; cyc[2] = 0u; rep[2] = 0u; lastj[2] = 0xFFFFFFFFu;
+    if (kid[2] < config.num_kangaroos) {
+        let kk = kangaroos[kid[2]];
+        ktype[2] = kk.ktype; dist[2] = kk.dist;
+        cyc[2] = kk.cycle_counter; rep[2] = kk.repeat_count; lastj[2] = kk.last_jump;
+        if (kk.is_active != 0u) { valid[2] = true; px[2] = kk.x; py[2] = kk.y; }
+    }
+    if (valid[2] && is_distinguished(px[2])) {
+        store_dp_fields(px[2], dist[2], ktype[2], kid[2]); dp_stored[2] = true;
+    }
+    // i = 3
+    kid[3] = t + 3u * num_threads;
+    valid[3] = false; dp_stored[3] = false;
+    px[3] = fe_one(); py[3] = fe_one(); dist[3] = fe_zero();
+    ktype[3] = 0u; cyc[3] = 0u; rep[3] = 0u; lastj[3] = 0xFFFFFFFFu;
+    if (kid[3] < config.num_kangaroos) {
+        let kk = kangaroos[kid[3]];
+        ktype[3] = kk.ktype; dist[3] = kk.dist;
+        cyc[3] = kk.cycle_counter; rep[3] = kk.repeat_count; lastj[3] = kk.last_jump;
+        if (kk.is_active != 0u) { valid[3] = true; px[3] = kk.x; py[3] = kk.y; }
+    }
+    if (valid[3] && is_distinguished(px[3])) {
+        store_dp_fields(px[3], dist[3], ktype[3], kid[3]); dp_stored[3] = true;
     }
 
-    // Current point in affine coordinates
-    var px: array<u32, 8>;
-    var py: array<u32, 8>;
-    
-    if (valid) {
-        px = k.x;
-        py = k.y;
-    } else {
-        // Dummy point for inactive threads
-        px = fe_one();
-        py = fe_one();
-    }
-
-    // Track if we already stored a DP this batch
-    var dp_stored = false;
-
-    // Check current position once before the walk.
-    // Subsequent checks are done after each successful jump.
-    if (valid && is_distinguished(px)) {
-        k.x = px;
-        k.y = py;
-        store_dp(k, kid);
-        dp_stored = true;
-    }
-
-    // Perform jumps
+    // ---- Main walk ----
     for (var step = 0u; step < config.steps_per_call; step++) {
-        var effective_jump_idx = jump_index_from_x(px);
-        if (valid) {
-            let in_cycle = (k.cycle_counter > config.cycle_cap)
-                || ((k.repeat_count & 0xFFFFu) > REPEAT_THRESHOLD);
-            if (in_cycle) {
-                effective_jump_idx = escape_index_from_state(px, kid, k.cycle_counter, step);
-                k.cycle_counter = 0u;
-                k.repeat_count = 0u;
-            } else {
-                if (effective_jump_idx == k.last_jump) {
-                    effective_jump_idx = (effective_jump_idx + 1u) & 0xFFu;
-                }
-                k.last_jump = effective_jump_idx;
-            }
-        }
-        let jump_idx = effective_jump_idx;
-        let jump_point = jump_points[jump_idx];
-        let jump_dist = jump_distances[jump_idx];
-        
-        // =====================================================================
-        // BATCH INVERSION (Montgomery's trick for dx = x_jump - x_point)
-        // =====================================================================
-        
-        // 1. Compute dx = x_jump - x_point and store in shared memory
-        //    If dx=0 (point equals jump point), use 1 to avoid poisoning the batch,
-        //    but track it to skip the affine add later (astronomically unlikely: 1/2^256).
-        var dx = fe_sub(jump_point.x, px);
-        var dx_was_zero = fe_is_zero(dx);
-        if (dx_was_zero) {
-            dx = fe_one();
-        }
-        shared_prod[lid] = dx;
-        workgroupBarrier();
+        // ===== PHASE A: select jumps + build dx for all GROUP_N points =====
+        var jidx: array<u32, 4>;
+        var dxwz: array<bool, 4>;
+        var dx: array<array<u32, 8>, 4>;
 
-        // 2. Tree-based batch inversion (Montgomery's trick with parallel tree)
-        //    Up-sweep builds product tree while saving right children.
-        //    Single fe_inv of root, then down-sweep propagates individual inverses.
-        //    Eliminates suffix scan: ~14 barriers vs ~30, ~18 fe_mul rounds vs ~26.
+        let a0 = phase_a(px[0], valid[0], cyc[0], rep[0], lastj[0], step, kid[0]);
+        jidx[0] = a0.jidx; dx[0] = a0.dx; dxwz[0] = a0.dxwz;
+        cyc[0] = a0.cyc; rep[0] = a0.rep; lastj[0] = a0.lastj;
 
-        // ===== UP-SWEEP: build product tree, save right children =====
-        // Common offsets for both supported workgroup sizes (64/128)
-        let save_l1 = WORKGROUP_SIZE >> 1u;
-        let save_l2 = save_l1 + (WORKGROUP_SIZE >> 2u);
-        let save_l3 = save_l2 + (WORKGROUP_SIZE >> 3u);
-        let save_l4 = save_l3 + (WORKGROUP_SIZE >> 4u);
+        let a1 = phase_a(px[1], valid[1], cyc[1], rep[1], lastj[1], step, kid[1]);
+        jidx[1] = a1.jidx; dx[1] = a1.dx; dxwz[1] = a1.dxwz;
+        cyc[1] = a1.cyc; rep[1] = a1.rep; lastj[1] = a1.lastj;
 
-        // Level 0 (stride 1)
-        if ((lid & 1u) == 1u) {
-            shared_save[lid >> 1u] = shared_prod[lid];
-            shared_prod[lid] = fe_mul(shared_prod[lid - 1u], shared_prod[lid]);
-        }
-        workgroupBarrier();
+        let a2 = phase_a(px[2], valid[2], cyc[2], rep[2], lastj[2], step, kid[2]);
+        jidx[2] = a2.jidx; dx[2] = a2.dx; dxwz[2] = a2.dxwz;
+        cyc[2] = a2.cyc; rep[2] = a2.rep; lastj[2] = a2.lastj;
 
-        // Level 1 (stride 2)
-        if ((lid & 3u) == 3u) {
-            shared_save[save_l1 + (lid >> 2u)] = shared_prod[lid];
-            shared_prod[lid] = fe_mul(shared_prod[lid - 2u], shared_prod[lid]);
-        }
-        workgroupBarrier();
+        let a3 = phase_a(px[3], valid[3], cyc[3], rep[3], lastj[3], step, kid[3]);
+        jidx[3] = a3.jidx; dx[3] = a3.dx; dxwz[3] = a3.dxwz;
+        cyc[3] = a3.cyc; rep[3] = a3.rep; lastj[3] = a3.lastj;
 
-        // Level 2 (stride 4)
-        if ((lid & 7u) == 7u) {
-            shared_save[save_l2 + (lid >> 3u)] = shared_prod[lid];
-            shared_prod[lid] = fe_mul(shared_prod[lid - 4u], shared_prod[lid]);
-        }
-        workgroupBarrier();
+        // ===== Forward prefix products =====
+        var subp: array<array<u32, 8>, 4>;
+        subp[0] = dx[0];
+        subp[1] = fe_mul(subp[0], dx[1]);
+        subp[2] = fe_mul(subp[1], dx[2]);
+        subp[3] = fe_mul(subp[2], dx[3]);
 
-        // Level 3 (stride 8)
-        if ((lid & 15u) == 15u) {
-            shared_save[save_l3 + (lid >> 4u)] = shared_prod[lid];
-            shared_prod[lid] = fe_mul(shared_prod[lid - 8u], shared_prod[lid]);
-        }
-        workgroupBarrier();
+        // ===== Single field inversion of the whole-group product =====
+        var inv = fe_inv(subp[3]);
 
-        // Level 4 (stride 16)
-        if ((lid & 31u) == 31u) {
-            shared_save[save_l4 + (lid >> 5u)] = shared_prod[lid];
-            shared_prod[lid] = fe_mul(shared_prod[lid - 16u], shared_prod[lid]);
-        }
-        workgroupBarrier();
-
-        if (WORKGROUP_SIZE == 128u) {
-            // Level 5 (stride 32): 2 threads merge 64-element groups
-            if ((lid & 63u) == 63u) {
-                shared_save[124u + (lid >> 6u)] = shared_prod[lid];
-                shared_prod[lid] = fe_mul(shared_prod[lid - 32u], shared_prod[lid]);
-            }
-            workgroupBarrier();
-
-            // Level 6 (stride 64): 1 thread merges full 128-element product
-            if (lid == 127u) {
-                shared_save[126u] = shared_prod[127u];
-                shared_prod[127u] = fe_mul(shared_prod[63u], shared_prod[127u]);
-            }
-        } else {
-            // WORKGROUP_SIZE == 64: final root merge at stride 32
-            if (lid == 63u) {
-                shared_save[62u] = shared_prod[63u];
-                shared_prod[63u] = fe_mul(shared_prod[31u], shared_prod[63u]);
-            }
-        }
-        workgroupBarrier();
-
-        // ===== INVERT root (total product of all dx values) =====
-        let root = WORKGROUP_SIZE - 1u;
-        if (lid == 0u) {
-            shared_prod[root] = fe_inv(shared_prod[root]);
-        }
-        workgroupBarrier();
-
-        // ===== DOWN-SWEEP: propagate inverses through tree =====
-        // At each node: inv(left) = inv(parent) * right_saved
-        //               inv(right) = inv(parent) * left_preserved
-
-        if (WORKGROUP_SIZE == 128u) {
-            // Level 6 (stride 64): 1 thread splits root inverse
-            if (lid == 127u) {
-                let inv_p = shared_prod[127u];
-                let left = shared_prod[63u];
-                let right = shared_save[126u];
-                shared_prod[63u] = fe_mul(inv_p, right);
-                shared_prod[127u] = fe_mul(inv_p, left);
-            }
-            workgroupBarrier();
-
-            // Level 5 (stride 32): 2 threads
-            if ((lid & 63u) == 63u) {
-                let inv_p = shared_prod[lid];
-                let left = shared_prod[lid - 32u];
-                let right = shared_save[124u + (lid >> 6u)];
-                shared_prod[lid - 32u] = fe_mul(inv_p, right);
-                shared_prod[lid] = fe_mul(inv_p, left);
-            }
-            workgroupBarrier();
-        } else {
-            // WORKGROUP_SIZE == 64: split root at stride 32
-            if (lid == 63u) {
-                let inv_p = shared_prod[63u];
-                let left = shared_prod[31u];
-                let right = shared_save[62u];
-                shared_prod[31u] = fe_mul(inv_p, right);
-                shared_prod[63u] = fe_mul(inv_p, left);
-            }
-            workgroupBarrier();
+        // ===== PHASE B backward: recover 1/dx_i then add, i = 3..0 =====
+        // i = 3
+        let dxinv3 = fe_mul(subp[2], inv);
+        inv = fe_mul(inv, dx[3]);
+        let b3 = phase_b_add(px[3], py[3], dist[3], cyc[3], rep[3], jidx[3], dxinv3, valid[3], dxwz[3]);
+        px[3] = b3.px; py[3] = b3.py; dist[3] = b3.dist; cyc[3] = b3.cyc; rep[3] = b3.rep;
+        if (b3.moved && !dp_stored[3] && is_distinguished(px[3])) {
+            store_dp_fields(px[3], dist[3], ktype[3], kid[3]); dp_stored[3] = true;
         }
 
-        // Level 4 (stride 16): 4 threads
-        if ((lid & 31u) == 31u) {
-            let inv_p = shared_prod[lid];
-            let left = shared_prod[lid - 16u];
-            let right = shared_save[save_l4 + (lid >> 5u)];
-            shared_prod[lid - 16u] = fe_mul(inv_p, right);
-            shared_prod[lid] = fe_mul(inv_p, left);
+        // i = 2
+        let dxinv2 = fe_mul(subp[1], inv);
+        inv = fe_mul(inv, dx[2]);
+        let b2 = phase_b_add(px[2], py[2], dist[2], cyc[2], rep[2], jidx[2], dxinv2, valid[2], dxwz[2]);
+        px[2] = b2.px; py[2] = b2.py; dist[2] = b2.dist; cyc[2] = b2.cyc; rep[2] = b2.rep;
+        if (b2.moved && !dp_stored[2] && is_distinguished(px[2])) {
+            store_dp_fields(px[2], dist[2], ktype[2], kid[2]); dp_stored[2] = true;
         }
-        workgroupBarrier();
 
-        // Level 3 (stride 8): 8 threads
-        if ((lid & 15u) == 15u) {
-            let inv_p = shared_prod[lid];
-            let left = shared_prod[lid - 8u];
-            let right = shared_save[save_l3 + (lid >> 4u)];
-            shared_prod[lid - 8u] = fe_mul(inv_p, right);
-            shared_prod[lid] = fe_mul(inv_p, left);
+        // i = 1
+        let dxinv1 = fe_mul(subp[0], inv);
+        inv = fe_mul(inv, dx[1]);
+        let b1 = phase_b_add(px[1], py[1], dist[1], cyc[1], rep[1], jidx[1], dxinv1, valid[1], dxwz[1]);
+        px[1] = b1.px; py[1] = b1.py; dist[1] = b1.dist; cyc[1] = b1.cyc; rep[1] = b1.rep;
+        if (b1.moved && !dp_stored[1] && is_distinguished(px[1])) {
+            store_dp_fields(px[1], dist[1], ktype[1], kid[1]); dp_stored[1] = true;
         }
-        workgroupBarrier();
 
-        // Level 2 (stride 4): 16 threads
-        if ((lid & 7u) == 7u) {
-            let inv_p = shared_prod[lid];
-            let left = shared_prod[lid - 4u];
-            let right = shared_save[save_l2 + (lid >> 3u)];
-            shared_prod[lid - 4u] = fe_mul(inv_p, right);
-            shared_prod[lid] = fe_mul(inv_p, left);
-        }
-        workgroupBarrier();
-
-        // Level 1 (stride 2): 32 threads
-        if ((lid & 3u) == 3u) {
-            let inv_p = shared_prod[lid];
-            let left = shared_prod[lid - 2u];
-            let right = shared_save[save_l1 + (lid >> 2u)];
-            shared_prod[lid - 2u] = fe_mul(inv_p, right);
-            shared_prod[lid] = fe_mul(inv_p, left);
-        }
-        workgroupBarrier();
-
-        // Level 0 (stride 1): 64 threads produce individual inverses
-        if ((lid & 1u) == 1u) {
-            let inv_p = shared_prod[lid];
-            let left = shared_prod[lid - 1u];
-            let right = shared_save[lid >> 1u];
-            shared_prod[lid - 1u] = fe_mul(inv_p, right);
-            shared_prod[lid] = fe_mul(inv_p, left);
-        }
-        workgroupBarrier();
-
-        // Now: shared_prod[lid] = 1/dx[lid] for all threads
-        let dx_inv = shared_prod[lid];
-
-        // =====================================================================
-        // POINT ADDITION AND DP CHECK
-        // =====================================================================
-
-        if (valid) {
-            // Skip if dx was zero (point collision - astronomically unlikely)
-            if (!dx_was_zero) {
-                let y_odd = (py[0] & 1u) != 0u;
-
-                // Normalize to class representative before the walk: {P, -P} -> even-y representative
-                var repr_y = py;
-                if (y_odd) {
-                    repr_y = fe_sub(fe_zero(), py);
-                }
-                let result_walk = affine_add_with_inv(px, repr_y, jump_point.x, jump_point.y, dx_inv);
-
-                px = result_walk.x;
-                py = result_walk.y;
-                if (y_odd) {
-                    // (-dist) + jump == jump - dist (mod 2^256)
-                    k.dist = scalar_sub_256(jump_dist, k.dist);
-                } else {
-                    k.dist = scalar_add_256(k.dist, jump_dist);
-                }
-
-                k.cycle_counter = k.cycle_counter + 1u;
-                let new_jump = px[0] & 0xFFFFu;
-                if (new_jump == (k.repeat_count >> 16u)) {
-                    let cnt = (k.repeat_count & 0xFFFFu) + 1u;
-                    k.repeat_count = (new_jump << 16u) | cnt;
-                } else {
-                    k.repeat_count = (new_jump << 16u) | 1u;
-                }
-
-                if (!dp_stored) {
-                    if (is_distinguished(px)) {
-                        k.x = px;
-                        k.y = py;
-                        store_dp(k, kid);
-                        dp_stored = true;
-                    }
-                }
-            }
+        // i = 0
+        let dxinv0 = inv; // = 1/dx[0]
+        let b0 = phase_b_add(px[0], py[0], dist[0], cyc[0], rep[0], jidx[0], dxinv0, valid[0], dxwz[0]);
+        px[0] = b0.px; py[0] = b0.py; dist[0] = b0.dist; cyc[0] = b0.cyc; rep[0] = b0.rep;
+        if (b0.moved && !dp_stored[0] && is_distinguished(px[0])) {
+            store_dp_fields(px[0], dist[0], ktype[0], kid[0]); dp_stored[0] = true;
         }
     }
 
-    // Write back updated state
-    if (valid) {
-        k.x = px;
-        k.y = py;
-        kangaroos[kid] = k;
+    // ---- WRITE BACK (unrolled) ----
+    if (valid[0]) {
+        var out: Kangaroo;
+        out.x = px[0]; out.y = py[0]; out.dist = dist[0];
+        out.ktype = ktype[0]; out.is_active = 1u;
+        out.cycle_counter = cyc[0]; out.repeat_count = rep[0]; out.last_jump = lastj[0];
+        out._padding = array<u32, 3>(0u, 0u, 0u);
+        kangaroos[kid[0]] = out;
+    }
+    if (valid[1]) {
+        var out: Kangaroo;
+        out.x = px[1]; out.y = py[1]; out.dist = dist[1];
+        out.ktype = ktype[1]; out.is_active = 1u;
+        out.cycle_counter = cyc[1]; out.repeat_count = rep[1]; out.last_jump = lastj[1];
+        out._padding = array<u32, 3>(0u, 0u, 0u);
+        kangaroos[kid[1]] = out;
+    }
+    if (valid[2]) {
+        var out: Kangaroo;
+        out.x = px[2]; out.y = py[2]; out.dist = dist[2];
+        out.ktype = ktype[2]; out.is_active = 1u;
+        out.cycle_counter = cyc[2]; out.repeat_count = rep[2]; out.last_jump = lastj[2];
+        out._padding = array<u32, 3>(0u, 0u, 0u);
+        kangaroos[kid[2]] = out;
+    }
+    if (valid[3]) {
+        var out: Kangaroo;
+        out.x = px[3]; out.y = py[3]; out.dist = dist[3];
+        out.ktype = ktype[3]; out.is_active = 1u;
+        out.cycle_counter = cyc[3]; out.repeat_count = rep[3]; out.last_jump = lastj[3];
+        out._padding = array<u32, 3>(0u, 0u, 0u);
+        kangaroos[kid[3]] = out;
     }
 }
