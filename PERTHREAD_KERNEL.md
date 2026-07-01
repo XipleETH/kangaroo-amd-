@@ -49,8 +49,10 @@ Fixed test key `0xe9ae4933d6` searched over increasingly large intervals
 | 48 | 12.07 s |
 | 52 | 68.27 s |
 | 56 | 401.97 s |
+| 60 | 3760.18 s (~62.7 min) |
 
-Time grows ~5.8× per +4 range bits (√N scaling × the kangaroo constant). Note this is the
+Time grows ~6× per +4 range bits (√N scaling × the kangaroo constant; single
+deterministic samples, so per-step ratios vary ~5.7–9.4×). Note this is the
 solver's *interval-search cost*, which is exponential in range and unchanged by this work;
 the **throughput** above is the kernel-power metric this optimization improves.
 
