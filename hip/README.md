@@ -14,17 +14,24 @@ that WGSL cannot express.
 | 2a. **256-bit field arithmetic** (`field_test.hip`) | ✅ **correct + fast** |
 | 2b. **EC point ops** (`ec_test.hip`) | ✅ **correct, anchored to secp256k1** |
 | 2c/3. **Full kangaroo solver** (`kangaroo.hip`) | ✅ **WORKS — recovers the 40-bit key** |
-| 4. Throughput tuning (**batch inversion**) | ⬜ next — the speed unlock |
+| 4a. **Montgomery batch inversion** (global-backed) | ✅ **~230 M ops/s (~4.6× WGSL)** |
+| 4b. Further tuning (faster fe_inv, GN sweep, wave tuning) | ⬜ next — toward ~1 G |
 
 ## Working solver (`kangaroo.hip`)
 
-Minimal 2-set (tame/wild) Pollard's Kangaroo, u64 distances, per-step inversion.
-Recovers `k = 0xe9ae4933d6` from `Q = k·G` on `[0, 2^40)` — first native-AMD kangaroo
-that solves an ECDLP. Current speed **~12 M ops/s** — SLOW because it does one `fe_inv`
-per step (255 squarings). Native `fe_mul` runs at ~13.6 G/s (see field_test), so the
-next step is **Montgomery batch inversion** (amortize one `fe_inv` over many kangaroos,
-as done in the WGSL kernel) to unlock the projected ~1–2 G ops/s. Also TODO for real
-targets: 256-bit distances, negation map, and pubkey-y recovery (modular sqrt).
+2-set (tame/wild) Pollard's Kangaroo, u64 distances. Recovers `k = 0xe9ae4933d6` from
+`Q = k·G` on `[0, 2^40)` — first native-AMD kangaroo that solves an ECDLP.
+
+**Speed progression on the RX 7800 XT:**
+- Per-step inversion (one `fe_inv`/step): ~12 M ops/s.
+- **Global-backed Montgomery batch inversion** (`k_walk_gb`, GN=16, group state streamed
+  from global memory, prefix products in a scratch buffer, Jacobian setup): **~230 M ops/s
+  — ~4.6× the WGSL kernel, ~19× the naive HIP.** Native `fe_mul` is ~13.6 G/s so headroom
+  remains: a faster `fe_inv` (Dettman addition chain vs the current square-and-multiply),
+  a GN/wavefront sweep, and larger herds should push toward the projected ~1 G ops/s.
+
+Also TODO for real targets: 256-bit distances (currently u64, ok to ~2^48), negation map,
+pubkey-y recovery (modular sqrt), a dx==0 guard, and cycle detection.
 
 ## Key result (Stage 2a) — the top risk is refuted
 

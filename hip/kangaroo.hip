@@ -16,13 +16,15 @@
 // ---- problem / tuning ----
 #define RANGE_BITS 40
 #define N_JUMPS    32
-#define N_TAME     2048
-#define N_WILD     2048
-#define N_KANG     (N_TAME + N_WILD)
-#define DP_BITS    12
-#define STEPS      512
-#define MAX_DP     (1u << 20)
-#define MAX_ITERS  4000
+#define N_TAME     131072
+#define N_WILD     131072
+#define N_KANG     (N_TAME + N_WILD)   // 262144
+#define GN         16         // kangaroos per thread (Montgomery batch inversion); N_KANG % GN == 0
+#define NUM_THREADS (N_KANG / GN)      // 16384
+#define DP_BITS    8
+#define STEPS      256
+#define MAX_DP     (1u << 21)
+#define MAX_ITERS  20000
 
 // affine add of DISTINCT points, inline (kangaroo hot path)
 __device__ inline void ec_add_inplace(fe& x, fe& y, const fe& jx, const fe& jy) {
@@ -33,14 +35,14 @@ __device__ inline void ec_add_inplace(fe& x, fe& y, const fe& jx, const fe& jy) 
 }
 
 __global__ void k_mkQ(fe* Qx, fe* Qy, u64 k0, u64 k1, u64 k2, u64 k3) {
-    jpt Q = scalar_mul_G(fe_set(k0,k1,k2,k3));
+    jpt Q = scalar_mul_G_jac(fe_set(k0,k1,k2,k3));
     *Qx = Q.x; *Qy = Q.y;
 }
 
 __global__ void k_mkjumps(fe* jx, fe* jy, const u64* js, int nj) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= nj) return;
-    jpt J = scalar_mul_G(fe_set(js[i],0,0,0));
+    jpt J = scalar_mul_G_jac(fe_set(js[i],0,0,0));
     jx[i] = J.x; jy[i] = J.y;
 }
 
@@ -50,12 +52,13 @@ __global__ void k_mkkang(fe* kx, fe* ky, u64* kd, unsigned char* kt,
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= N_KANG) return;
     if (i < N_TAME) {
-        u64 s = mid + (u64)i;
-        jpt P = scalar_mul_G(fe_set(s,0,0,0));
+        // spread tame kangaroos across [0, 2^RANGE_BITS): step = 2^RANGE_BITS / N_TAME
+        u64 s = (u64)i << (RANGE_BITS - 17);   // N_TAME = 2^17 = 131072
+        jpt P = scalar_mul_G_jac(fe_set(s,0,0,0));
         kx[i]=P.x; ky[i]=P.y; kd[i]=s; kt[i]=0;
     } else {
         u64 w = (u64)(i - N_TAME);
-        jpt off = scalar_mul_G(fe_set(w,0,0,0));
+        jpt off = scalar_mul_G_jac(fe_set(w,0,0,0));
         jpt Q; Q.inf=false; Q.x=*Qx; Q.y=*Qy;
         jpt P = j_add(Q, off);
         kx[i]=P.x; ky[i]=P.y; kd[i]=w; kt[i]=1;
@@ -81,12 +84,99 @@ __global__ void k_walk(fe* kx, fe* ky, u64* kd, const unsigned char* kt,
     kx[i]=x; ky[i]=y; kd[i]=d;
 }
 
+// Batched walk: each thread owns GN kangaroos and does ONE fe_inv per step
+// (Montgomery batch inversion over the group) instead of one per kangaroo.
+__global__ void k_walk_batch(fe* kx, fe* ky, u64* kd, const unsigned char* kt,
+                             const fe* jx, const fe* jy, const u64* js, int nj,
+                             fe* dpx, u64* dpd, unsigned char* dpt, unsigned* dpcnt,
+                             int steps, u64 dpmask) {
+    int tid = blockIdx.x*blockDim.x + threadIdx.x;
+    int base = tid*GN;
+    if (base + GN > N_KANG) return;
+    fe X[GN], Y[GN]; u64 D[GN]; unsigned char T[GN];
+    #pragma unroll
+    for (int g=0; g<GN; ++g){ X[g]=kx[base+g]; Y[g]=ky[base+g]; D[g]=kd[base+g]; T[g]=kt[base+g]; }
+
+    for (int s=0; s<steps; ++s) {
+        int IDX[GN]; fe PRE[GN];
+        fe prod = fe_one();
+        // forward: pick jumps, build prefix products of dx = jump.x - x
+        #pragma unroll
+        for (int g=0; g<GN; ++g){
+            IDX[g] = (int)(X[g].n[0] % (u64)nj);
+            fe dx = fe_sub(jx[IDX[g]], X[g]);
+            prod = fe_mul(prod, dx);
+            PRE[g] = prod;
+        }
+        fe inv = fe_inv(prod);          // the single inversion
+        // backward: recover 1/dx[g], add the jump, drop DPs
+        #pragma unroll
+        for (int g=GN-1; g>=0; --g){
+            fe dxinv = (g>0) ? fe_mul(inv, PRE[g-1]) : inv;
+            fe dx = fe_sub(jx[IDX[g]], X[g]);
+            inv = fe_mul(inv, dx);
+            fe lam = fe_mul(fe_sub(jy[IDX[g]], Y[g]), dxinv);
+            fe nx = fe_sub(fe_sub(fe_sqr(lam), X[g]), jx[IDX[g]]);
+            fe ny = fe_sub(fe_mul(lam, fe_sub(X[g], nx)), Y[g]);
+            X[g]=nx; Y[g]=ny; D[g]+=js[IDX[g]];
+            if ((X[g].n[0]&dpmask)==0ULL){
+                unsigned pos=atomicAdd(dpcnt,1u);
+                if (pos<MAX_DP){ dpx[pos]=X[g]; dpd[pos]=D[g]; dpt[pos]=T[g]; }
+            }
+        }
+    }
+    #pragma unroll
+    for (int g=0; g<GN; ++g){ kx[base+g]=X[g]; ky[base+g]=Y[g]; kd[base+g]=D[g]; }
+}
+
+// Global-backed batch walk: point state stays in global memory (streamed), only
+// the rolling product/inverse is in registers; prefix products live in a global
+// scratch buffer (SoA). Thread t owns kangaroos {t, t+NT, t+2*NT, ...} (strided).
+__global__ void k_walk_gb(fe* kx, fe* ky, u64* kd, const unsigned char* kt,
+                          const fe* jx, const fe* jy, const u64* js, int nj,
+                          fe* PRE,
+                          fe* dpx, u64* dpd, unsigned char* dpt, unsigned* dpcnt,
+                          int steps, u64 dpmask) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    if (t >= NUM_THREADS) return;
+    for (int s=0; s<steps; ++s) {
+        // forward: prefix products of dx = jump.x - x, stored to scratch (SoA)
+        fe prod = fe_one();
+        for (int j=0; j<GN; ++j) {
+            int kid = t + j*NUM_THREADS;
+            fe x = kx[kid];
+            int idx = (int)(x.n[0] % (u64)nj);
+            prod = fe_mul(prod, fe_sub(jx[idx], x));
+            PRE[j*NUM_THREADS + t] = prod;
+        }
+        fe inv = fe_inv(prod);           // one inversion for GN kangaroos
+        // backward: recover 1/dx, add jump, write back, drop DPs
+        for (int j=GN-1; j>=0; --j) {
+            int kid = t + j*NUM_THREADS;
+            fe x = kx[kid], y = ky[kid];
+            int idx = (int)(x.n[0] % (u64)nj);
+            fe dxinv = (j>0) ? fe_mul(inv, PRE[(j-1)*NUM_THREADS + t]) : inv;
+            inv = fe_mul(inv, fe_sub(jx[idx], x));
+            fe lam = fe_mul(fe_sub(jy[idx], y), dxinv);
+            fe nx = fe_sub(fe_sub(fe_sqr(lam), x), jx[idx]);
+            fe ny = fe_sub(fe_mul(lam, fe_sub(x, nx)), y);
+            kx[kid]=nx; ky[kid]=ny;
+            u64 d = kd[kid] + js[idx]; kd[kid]=d;
+            if ((nx.n[0] & dpmask)==0ULL) {
+                unsigned pos = atomicAdd(dpcnt,1u);
+                if (pos<MAX_DP){ dpx[pos]=nx; dpd[pos]=d; dpt[pos]=kt[kid]; }
+            }
+        }
+    }
+}
+
 __global__ void k_verify(const fe* Qx, u64 k0, u64 k1, u64 k2, u64 k3, unsigned* ok) {
-    jpt P = scalar_mul_G(fe_set(k0,k1,k2,k3));
+    jpt P = scalar_mul_G_jac(fe_set(k0,k1,k2,k3));
     *ok = fe_eq(P.x, *Qx) ? 1u : 0u;
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered so progress streams to logs
     hipDeviceProp_t prop; CHECK(hipGetDeviceProperties(&prop,0));
     printf("Device: %s (%s)\n", prop.name, prop.gcnArchName);
     printf("Problem: k*G, k in [0, 2^%d).  kangaroos=%d  dp_bits=%d\n", RANGE_BITS, N_KANG, DP_BITS);
@@ -109,6 +199,7 @@ int main() {
     CHECK(hipMalloc(&dpx,MAX_DP*sizeof(fe))); CHECK(hipMalloc(&dpd,MAX_DP*sizeof(u64)));
     CHECK(hipMalloc(&dpt,MAX_DP*sizeof(unsigned char))); CHECK(hipMalloc(&dpcnt,sizeof(unsigned)));
     CHECK(hipMalloc(&d_ok,sizeof(unsigned)));
+    fe* PRE; CHECK(hipMalloc(&PRE,(size_t)N_KANG*sizeof(fe)));   // prefix-product scratch
     CHECK(hipMemcpy(js,h_js,N_JUMPS*sizeof(u64),hipMemcpyHostToDevice));
 
     // setup
@@ -117,7 +208,28 @@ int main() {
     u64 mid = 1ULL << (RANGE_BITS-1);
     hipLaunchKernelGGL(k_mkkang, dim3((N_KANG+255)/256),dim3(256),0,0, kx,ky,kd,kt,Qx,Qy,mid);
     CHECK(hipDeviceSynchronize());
-    printf("setup done. walking...\n");
+    printf("setup done.\n");
+    const u64 dpmask = (1ULL<<DP_BITS)-1ULL;
+
+    // ---- quick throughput benchmark (walks the herd, discards DPs) ----
+    {
+        for (int w=0; w<3; ++w) { hipMemset(dpcnt,0,4);
+            hipLaunchKernelGGL(k_walk_gb, dim3((NUM_THREADS+255)/256),dim3(256),0,0,
+                kx,ky,kd,kt,jx,jy,js,N_JUMPS,PRE,dpx,dpd,dpt,dpcnt,STEPS,dpmask); }
+        CHECK(hipDeviceSynchronize());
+        hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1);
+        const int NB=60; hipEventRecord(e0);
+        for (int b=0;b<NB;++b){ hipMemset(dpcnt,0,4);
+            hipLaunchKernelGGL(k_walk_gb, dim3((NUM_THREADS+255)/256),dim3(256),0,0,
+                kx,ky,kd,kt,jx,jy,js,N_JUMPS,PRE,dpx,dpd,dpt,dpcnt,STEPS,dpmask); }
+        hipEventRecord(e1); hipEventSynchronize(e1);
+        float ms=0; hipEventElapsedTime(&ms,e0,e1);
+        printf("BENCH(GN=%d): %.1f M ops/s\n", GN, (double)NB*N_KANG*STEPS/(ms*1e3));
+    }
+    // re-init kangaroos so the solve starts fresh
+    hipLaunchKernelGGL(k_mkkang, dim3((N_KANG+255)/256),dim3(256),0,0, kx,ky,kd,kt,Qx,Qy,mid);
+    CHECK(hipDeviceSynchronize());
+    printf("walking...\n");
 
     // host DP table
     std::unordered_map<std::string, std::pair<u64,unsigned char>> table;
@@ -125,15 +237,14 @@ int main() {
     fe*  h_dpx = new fe[MAX_DP];
     u64* h_dpd = new u64[MAX_DP];
     unsigned char* h_dpt = new unsigned char[MAX_DP];
-    const u64 dpmask = (1ULL<<DP_BITS)-1ULL;
 
     u64 total_ops = 0; bool solved=false; u64 found_k=0;
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (int it=0; it<MAX_ITERS && !solved; ++it) {
         CHECK(hipMemset(dpcnt,0,sizeof(unsigned)));
-        hipLaunchKernelGGL(k_walk, dim3((N_KANG+255)/256),dim3(256),0,0,
-                           kx,ky,kd,kt, jx,jy,js,N_JUMPS, dpx,dpd,dpt,dpcnt, STEPS, dpmask);
+        hipLaunchKernelGGL(k_walk_gb, dim3((NUM_THREADS+255)/256),dim3(256),0,0,
+                           kx,ky,kd,kt, jx,jy,js,N_JUMPS, PRE, dpx,dpd,dpt,dpcnt, STEPS, dpmask);
         CHECK(hipDeviceSynchronize());
         total_ops += (u64)N_KANG*STEPS;
 
