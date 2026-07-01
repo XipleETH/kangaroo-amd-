@@ -12,8 +12,8 @@ that WGSL cannot express.
 | 0. Feasibility (gfx1101 HIP support, Win10) | ✅ confirmed |
 | 1. Toolchain + trivial kernel (`hello.hip`) | ✅ validated on RX 7800 XT |
 | 2a. **256-bit field arithmetic** (`field_test.hip`) | ✅ **correct + fast** |
-| 2b. EC point ops (affine add + batch inversion) | ⬜ next |
-| 2c. Kangaroo walk loop + jump table + DP detection | ⬜ |
+| 2b. **EC point ops** (`ec_test.hip`) | ✅ **correct, anchored to secp256k1** |
+| 2c. Kangaroo walk loop + jump table + DP detection | ⬜ next |
 | 3. Host driver + DP table | ⬜ |
 | 4. Throughput tuning | ⬜ |
 
