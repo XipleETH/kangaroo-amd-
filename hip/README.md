@@ -13,9 +13,18 @@ that WGSL cannot express.
 | 1. Toolchain + trivial kernel (`hello.hip`) | ✅ validated on RX 7800 XT |
 | 2a. **256-bit field arithmetic** (`field_test.hip`) | ✅ **correct + fast** |
 | 2b. **EC point ops** (`ec_test.hip`) | ✅ **correct, anchored to secp256k1** |
-| 2c. Kangaroo walk loop + jump table + DP detection | ⬜ next |
-| 3. Host driver + DP table | ⬜ |
-| 4. Throughput tuning | ⬜ |
+| 2c/3. **Full kangaroo solver** (`kangaroo.hip`) | ✅ **WORKS — recovers the 40-bit key** |
+| 4. Throughput tuning (**batch inversion**) | ⬜ next — the speed unlock |
+
+## Working solver (`kangaroo.hip`)
+
+Minimal 2-set (tame/wild) Pollard's Kangaroo, u64 distances, per-step inversion.
+Recovers `k = 0xe9ae4933d6` from `Q = k·G` on `[0, 2^40)` — first native-AMD kangaroo
+that solves an ECDLP. Current speed **~12 M ops/s** — SLOW because it does one `fe_inv`
+per step (255 squarings). Native `fe_mul` runs at ~13.6 G/s (see field_test), so the
+next step is **Montgomery batch inversion** (amortize one `fe_inv` over many kangaroos,
+as done in the WGSL kernel) to unlock the projected ~1–2 G ops/s. Also TODO for real
+targets: 256-bit distances, negation map, and pubkey-y recovery (modular sqrt).
 
 ## Key result (Stage 2a) — the top risk is refuted
 
