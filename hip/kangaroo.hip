@@ -18,9 +18,9 @@
 #define RANGE_BITS 40
 #endif
 #define N_JUMPS    32
-#define N_TAME     1048576
-#define N_WILD     1048576
-#define N_KANG     (N_TAME + N_WILD)   // 2097152 (32768 threads @ GN=64 ~ 1.04 G ops/s)
+#define N_TAME     2097152
+#define N_WILD     2097152
+#define N_KANG     (N_TAME + N_WILD)   // 4194304 (65536 threads @ GN=64 ~ 1.17 G ops/s)
 #define GN         64         // kangaroos per thread (Montgomery batch inversion); N_KANG % GN == 0
 #define NUM_THREADS (N_KANG / GN)
 #ifndef DP_BITS

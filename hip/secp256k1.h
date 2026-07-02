@@ -51,13 +51,8 @@ __device__ inline fe fe_sub(const fe& a, const fe& b) {
     if ((u64)bor){ u128 c=0; for(int i=0;i<4;++i){ u128 s=(u128)r.n[i]+SECP_P[i]+c; r.n[i]=(u64)s; c=s>>64; } }
     return r;
 }
-__device__ inline fe fe_mul(const fe& a, const fe& b) {
-    u64 t[8]={0,0,0,0,0,0,0,0};
-    for (int i=0;i<4;++i){
-        u64 carry=0;
-        for (int j=0;j<4;++j){ u128 prod=(u128)a.n[i]*b.n[j]+t[i+j]+carry; t[i+j]=(u64)prod; carry=(u64)(prod>>64); }
-        t[i+4]=carry;
-    }
+// reduce a 512-bit product t[0..7] (little-endian) mod p, using 2^256 ≡ C = 2^32+977.
+__device__ inline fe reduce512(u64 t[8]) {
     const u128 C=0x1000003D1ULL;
     u128 c0=(u128)t[0]+C*t[4];
     u128 c1=(u128)t[1]+C*t[5]+(u64)(c0>>64);
@@ -77,7 +72,53 @@ __device__ inline fe fe_mul(const fe& a, const fe& b) {
     }
     fe_cond_sub_p(r); return r;
 }
-__device__ inline fe fe_sqr(const fe& a){ return fe_mul(a,a); }
+
+__device__ inline fe fe_mul(const fe& a, const fe& b) {
+    u64 t[8]={0,0,0,0,0,0,0,0};
+    for (int i=0;i<4;++i){
+        u64 carry=0;
+        for (int j=0;j<4;++j){ u128 prod=(u128)a.n[i]*b.n[j]+t[i+j]+carry; t[i+j]=(u64)prod; carry=(u64)(prod>>64); }
+        t[i+4]=carry;
+    }
+    return reduce512(t);
+}
+
+// Dedicated squaring: 6 off-diagonal products (doubled) + 4 diagonals, vs 16 for
+// full multiply. ~1.5x fewer u64xu64 products -> faster fe_inv (255 squarings).
+__device__ inline fe fe_sqr(const fe& a) {
+    u64 t[8]={0,0,0,0,0,0,0,0};
+    u64 c;
+    // off-diagonal products a_i*a_j (i<j), single count (each contributes to limbs i+j, i+j+1)
+    { u128 p=(u128)a.n[0]*a.n[1];      t[1]=(u64)p; c=(u64)(p>>64); }
+    { u128 p=(u128)a.n[0]*a.n[2]+c;    t[2]=(u64)p; c=(u64)(p>>64); }
+    { u128 p=(u128)a.n[0]*a.n[3]+c;    t[3]=(u64)p; t[4]=(u64)(p>>64); }
+    { u128 p=(u128)a.n[1]*a.n[2]+t[3]; t[3]=(u64)p; c=(u64)(p>>64); }
+    { u128 p=(u128)a.n[1]*a.n[3]+t[4]+c; t[4]=(u64)p; t[5]=(u64)(p>>64); }
+    { u128 p=(u128)a.n[2]*a.n[3]+t[5]; t[5]=(u64)p; t[6]=(u64)(p>>64); }
+    // double the off-diagonal sum (t <<= 1)
+    u64 cr=0;
+    #pragma unroll
+    for (int i=0;i<8;++i){ u64 nv=(t[i]<<1)|cr; cr=t[i]>>63; t[i]=nv; }
+    // add diagonals a_i^2 at (2i, 2i+1) with carry propagation
+    { u128 d=(u128)a.n[0]*a.n[0]; u128 s=(u128)t[0]+(u64)d; t[0]=(u64)s; u64 cc=(u64)(s>>64);
+      s=(u128)t[1]+(u64)(d>>64)+cc; t[1]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[2]+cc; t[2]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[3]+cc; t[3]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[4]+cc; t[4]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[5]+cc; t[5]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[6]+cc; t[6]=(u64)s; cc=(u64)(s>>64); t[7]+=cc; }
+    { u128 d=(u128)a.n[1]*a.n[1]; u128 s=(u128)t[2]+(u64)d; t[2]=(u64)s; u64 cc=(u64)(s>>64);
+      s=(u128)t[3]+(u64)(d>>64)+cc; t[3]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[4]+cc; t[4]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[5]+cc; t[5]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[6]+cc; t[6]=(u64)s; cc=(u64)(s>>64); t[7]+=cc; }
+    { u128 d=(u128)a.n[2]*a.n[2]; u128 s=(u128)t[4]+(u64)d; t[4]=(u64)s; u64 cc=(u64)(s>>64);
+      s=(u128)t[5]+(u64)(d>>64)+cc; t[5]=(u64)s; cc=(u64)(s>>64);
+      s=(u128)t[6]+cc; t[6]=(u64)s; cc=(u64)(s>>64); t[7]+=cc; }
+    { u128 d=(u128)a.n[3]*a.n[3]; u128 s=(u128)t[6]+(u64)d; t[6]=(u64)s; u64 cc=(u64)(s>>64);
+      t[7]+=(u64)(d>>64)+cc; }
+    return reduce512(t);
+}
 
 // a^(p-2) via Peter Dettman's addition chain (255 squarings + 15 muls),
 // the libsecp256k1 chain. ~3x fewer field ops than square-and-multiply.

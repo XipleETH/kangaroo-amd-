@@ -37,8 +37,14 @@ that WGSL cannot express.
 **~1.17 G ops/s** — in the same order of magnitude as an Nvidia RTX 3090 running RCKangaroo
 (~4 G on a much larger card), i.e. competitive per-tier. What made it: global-backed group
 state (registers spilled), the Dettman inversion chain, large GN, and heavy occupancy.
-Native `fe_mul` is ~13.6 G/s, so remaining headroom is compute (a dedicated `fe_sqr` — the
-255 squarings in `fe_inv` still call `fe_mul(a,a)`) and less global streaming.
+
+**This is the ceiling of this kernel design — it is memory/occupancy-bound, not
+compute-bound.** A dedicated `fe_sqr` (validated in `sqr_test.hip`: 0 mismatches vs
+`fe_mul(a,a)`, ~1.14× faster in isolation) gave **~0% end-to-end** — proof the bottleneck
+is streaming the group's point state from global memory, not the field arithmetic. `fe_mul`
+runs at ~13.6 G/s and `fe_sqr` at ~15.7 G/s standalone, so the only path past ~1.19 G is a
+memory-traffic redesign (keep more point state in registers/LDS without spilling), which is
+a research-grade rewrite with uncertain payoff. `fe_sqr` is kept (correct, no downside).
 
 TODO for real targets (#135): 256-bit distances (currently u64, ok to ~2^48), negation map,
 pubkey-y recovery (modular sqrt), a `dx==0` guard, and cycle detection.
