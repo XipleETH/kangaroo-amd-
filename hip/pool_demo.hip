@@ -67,6 +67,20 @@ __global__ void k_walk(fe* kx, fe* ky, u64* kd, const fe* jx, const fe* jy, cons
     }
 }
 
+#define MAXC 64
+// Validate a DP endpoint on the GPU: a real tame DP satisfies dist*G == P; a real
+// wild DP satisfies Q + dist*G == P. Plus the DP mask. This is the TRUSTLESS layer:
+// it deterministically rejects garbage/fabricated DPs (their dist*G != their x).
+__global__ void k_verify(const DP* dps, int n, fe Qx, fe Qy, u64 dpmask, unsigned char* ok){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n)return;
+    DP d=dps[i];
+    if((d.x[0]&dpmask)!=0ULL){ ok[i]=0; return; }                 // fails the DP mask
+    jpt P=scalar_mul_G_jac(fe_set(d.dist,0,0,0));
+    if(d.type==1){ jpt Q; Q.inf=false; Q.x=Qx; Q.y=Qy; P=j_add(Q,P); }  // wild: + Q
+    fe X=fe_set(d.x[0],d.x[1],d.x[2],d.x[3]);
+    ok[i]=fe_eq(P.x,X)?1:0;
+}
+
 static int run_client(int id, int role, const char* outfile, int dispatches){
     setvbuf(stdout,NULL,_IONBF,0);
     printf("client %d (%s): setup...\n", id, role==0?"tame":"wild");
@@ -107,42 +121,89 @@ static bool xeq(const DP&a, const DP&b){ return a.x[0]==b.x[0]&&a.x[1]==b.x[1]&&
 static int dpcmp(const void* pa, const void* pb){ const DP*a=(const DP*)pa,*b=(const DP*)pb;
     for(int i=0;i<4;++i){ if(a->x[i]!=b->x[i]) return a->x[i]<b->x[i]?-1:1; } return 0; }
 
+// A cheater who submits mask-valid but bogus DPs to inflate its reward share.
+// (random x with the low DP_BITS zeroed -> passes the mask; random dist -> endpoint
+//  check dist*G==x FAILS, so the validator rejects every one.)
+static int run_faker(int id, const char* outfile, int count){
+    setvbuf(stdout,NULL,_IONBF,0);
+    std::vector<DP> recs; u64 rng=0xF00DULL^(u64)id; const u64 dpmask=(1ULL<<DP_BITS)-1ULL;
+    for(int i=0;i<count;++i){ DP r;
+        for(int j=0;j<4;++j){ rng=rng*6364136223846793005ULL+1442695040888963407ULL; r.x[j]=rng; }
+        r.x[0]&=~dpmask;                                                   // look legit ...
+        rng=rng*6364136223846793005ULL+1442695040888963407ULL; r.dist=rng>>20;  // ... bogus dist
+        r.type=(u32)(i&1); r.client=(u32)id; recs.push_back(r); }
+    FILE* f=fopen(outfile,"wb"); if(!f){ printf("cannot open %s\n",outfile); return 1; }
+    fwrite(recs.data(),sizeof(DP),recs.size(),f); fclose(f);
+    printf("faker %d wrote %d FAKE DPs (mask-valid, endpoint-bogus) to %s\n", id, count, outfile);
+    return 0;
+}
+
 static int run_detect(int nfiles, char** files){
     setvbuf(stdout,NULL,_IONBF,0);
-    // Merge every client's DPs, sort by x, then a run of equal-x DPs with
-    // differing type is a cross-client tame<->wild collision that solves k.
     std::vector<DP> all;
     for(int fi=0; fi<nfiles; ++fi){
         FILE* f=fopen(files[fi],"rb"); if(!f){ printf("cannot open %s\n",files[fi]); return 1; }
         DP r; while(fread(&r,sizeof(DP),1,f)==1) all.push_back(r);
         fclose(f);
     }
-    printf("merged %zu DPs from %d files\n", all.size(), nfiles);
-    if(!all.empty()) qsort(all.data(), all.size(), sizeof(DP), dpcmp);
-    for(size_t i=1;i<all.size();++i){
-        if(xeq(all[i-1],all[i]) && all[i-1].type!=all[i].type){
-            DP a=all[i-1], b=all[i];
-            u64 dt=(a.type==0)?a.dist:b.dist, dw=(a.type==1)?a.dist:b.dist;
-            u64 k = dt - dw;
+    int n=(int)all.size(); printf("merged %d DPs from %d files\n", n, nfiles);
+    if(n==0){ printf("no DPs\n"); return 1; }
+
+    // The public target Q = k*G (known to everyone; the detector never needs k).
+    fe *dQx,*dQy; CHECK(hipMalloc(&dQx,sizeof(fe))); CHECK(hipMalloc(&dQy,sizeof(fe)));
+    hipLaunchKernelGGL(k_mkQ,dim3(1),dim3(1),0,0,dQx,dQy,(u64)KTEST_LO); CHECK(hipDeviceSynchronize());
+    fe hQx,hQy; CHECK(hipMemcpy(&hQx,dQx,sizeof(fe),hipMemcpyDeviceToHost)); CHECK(hipMemcpy(&hQy,dQy,sizeof(fe),hipMemcpyDeviceToHost));
+
+    // Validate EVERY DP on the GPU (chunked to stay under the 2s Windows TDR).
+    DP* dAll; CHECK(hipMalloc(&dAll,(size_t)n*sizeof(DP)));
+    CHECK(hipMemcpy(dAll,all.data(),(size_t)n*sizeof(DP),hipMemcpyHostToDevice));
+    unsigned char* dok; CHECK(hipMalloc(&dok,n));
+    const u64 dpmask=(1ULL<<DP_BITS)-1ULL; const int CH=131072;
+    for(int off=0; off<n; off+=CH){ int m=(n-off<CH)?(n-off):CH;
+        hipLaunchKernelGGL(k_verify,dim3((m+255)/256),dim3(256),0,0,dAll+off,m,hQx,hQy,dpmask,dok+off);
+        CHECK(hipDeviceSynchronize()); }
+    std::vector<unsigned char> ok(n); CHECK(hipMemcpy(ok.data(),dok,n,hipMemcpyDeviceToHost));
+
+    // Per-client contribution accounting — only endpoint-VALID DPs count.
+    long vc[MAXC]={0}, ic[MAXC]={0}; long totv=0; bool seen[MAXC]={false};
+    for(int i=0;i<n;++i){ u32 c=all[i].client; if(c<MAXC){ seen[c]=true; if(ok[i]){vc[c]++; totv++;} else ic[c]++; } }
+    printf("\nContribution (only endpoint-verified DPs earn a share; fakes rejected):\n");
+    printf("  client   valid       invalid     share\n");
+    for(int c=0;c<MAXC;++c) if(seen[c])
+        printf("  %-6d   %-10ld  %-10ld  %5.1f%%\n", c, vc[c], ic[c], totv?100.0*vc[c]/totv:0.0);
+    printf("  total valid = %ld\n", totv);
+
+    // Collision detection among VALID DPs only.
+    std::vector<DP> valid; valid.reserve(totv);
+    for(int i=0;i<n;++i) if(ok[i]) valid.push_back(all[i]);
+    if(!valid.empty()) qsort(valid.data(), valid.size(), sizeof(DP), dpcmp);
+    for(size_t i=1;i<valid.size();++i){
+        if(xeq(valid[i-1],valid[i]) && valid[i-1].type!=valid[i].type){
+            DP a=valid[i-1], b=valid[i];
+            u64 dt=(a.type==0)?a.dist:b.dist, dw=(a.type==1)?a.dist:b.dist; u64 k=dt-dw;
             u32 ct=(a.type==0?a.client:b.client), cw=(a.type==1?a.client:b.client);
-            printf("\n*** CROSS-CLIENT COLLISION ***\n");
+            printf("\n*** CROSS-CLIENT COLLISION (validated DPs) ***\n");
             printf("  tame DP from client %u  +  wild DP from client %u\n", ct, cw);
             printf("  recovered k = 0x%llx  (expected 0x%llx)  -> %s\n",
-                   (unsigned long long)k, (unsigned long long)KTEST_LO, k==KTEST_LO?"MATCH":"mismatch");
-            printf("  => a fair split would credit clients {%u, %u}\n", ct, cw);
-            printf("  (neither client could solve alone; the pooled DPs did)\n");
+                   (unsigned long long)k,(unsigned long long)KTEST_LO,k==KTEST_LO?"MATCH":"mismatch");
+            printf("\nNote: endpoint validation kills GARBAGE fakes, but a 'smart' faker\n"
+                   "(random d, compute d*G, keep if masked) passes it yet isn't on the shared\n"
+                   "walk -> that residual is closed by rate-limits/stake, not cryptography.\n");
             return k==KTEST_LO?0:1;
         }
     }
-    printf("no cross-type collision yet (run the clients for more dispatches)\n");
+    printf("\nno cross-type collision among valid DPs (run the clients longer)\n");
     return 1;
 }
 
 int main(int argc, char** argv){
     if(argc>=2 && strcmp(argv[1],"client")==0 && argc==6)
         return run_client(atoi(argv[2]), strcmp(argv[3],"wild")==0?1:0, argv[4], atoi(argv[5]));
+    if(argc==5 && strcmp(argv[1],"faker")==0)
+        return run_faker(atoi(argv[2]), argv[3], atoi(argv[4]));
     if(argc>=3 && strcmp(argv[1],"detect")==0)
         return run_detect(argc-2, argv+2);
-    printf("usage:\n  %s client <id> <tame|wild> <out.dp> <dispatches>\n  %s detect <f0.dp> <f1.dp> ...\n", argv[0], argv[0]);
+    printf("usage:\n  %s client <id> <tame|wild> <out.dp> <dispatches>\n"
+           "  %s faker  <id> <out.dp> <count>\n  %s detect <f0.dp> <f1.dp> ...\n", argv[0], argv[0], argv[0]);
     return 2;
 }

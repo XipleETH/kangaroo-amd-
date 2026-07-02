@@ -50,6 +50,35 @@ This is exactly the pool model: independent clients emit DPs against a **shared 
 walk**; a central server detects the cross-client collision and attributes it. AMD + Nvidia
 is just "more clients".
 
+### DP validation + fair-share accounting (the trust-minimized layer) ✅
+
+The detector now **verifies every DP on the GPU** and pays only for real work:
+
+- **Endpoint check** (`k_verify`): a real tame DP satisfies `dist·G == P`, a real wild DP
+  satisfies `Q + dist·G == P`, plus the DP-bits mask. This is **deterministic and trustless**
+  — no operator judgement. Garbage/fabricated DPs (`dist·G != x`) are rejected outright.
+- **Per-client accounting**: only endpoint-valid DPs earn a share; the split is
+  `valid_i / total_valid`.
+
+Demo with a cheater (`faker` injects 500k mask-valid but bogus DPs as client 2):
+
+```
+pool_demo client 0 tame c0.dp 80
+pool_demo client 1 wild c1.dp 80
+pool_demo faker  2 c2.dp 500000
+pool_demo detect c0.dp c1.dp c2.dp
+  client   valid      invalid    share
+  0        1315744    0          51.4%
+  1        1245743    0          48.6%
+  2        0          500000      0.0%   <- 500k fakes, all rejected, 0 reward
+  *** CROSS-CLIENT COLLISION (validated DPs) ***  recovered k -> MATCH
+```
+
+**Honest limit (shown in the output):** endpoint validation kills *garbage* fakes, but a
+*smart* faker (pick random `d`, compute `d·G`, keep if masked) passes the endpoint check yet
+its DP isn't on the shared walk. That residual is **not closable by cryptography** — it needs
+rate-limits vs physical hashrate + refundable stake. Validation ≠ proof-of-work.
+
 ### Why a canonical spec is mandatory (the real interop blocker)
 
 DPs from two clients only collide if **every client iterates the identical map**
@@ -92,9 +121,11 @@ Nvidia client (RCKangaroo   ├─ DP batches (TLS, canonical-spec-tagged)
 ## Roadmap
 
 - **P0 ✅** cross-client DP pooling + collision + attribution (`pool_demo.hip`).
-- **P1** trust-minimized MVP: coordination server (leases + validate + dedup + detect),
-  AMD adapter on `kangaroo.hip`, **RCKangaroo fork + sidecar**, Merkle contribution log.
-  Custody = single operator (be explicit it's "trust the operator, verifiable accounting").
+- **P1a ✅** DP endpoint validation + fair-share accounting + fake-DP rejection (in the demo).
+- **P1** trust-minimized MVP: turn the in-process detector into a **networked coordination
+  server** (leases + validate + dedup + detect over the wire), AMD adapter on `kangaroo.hip`,
+  **RCKangaroo fork + sidecar**, signed Merkle contribution log. Custody = single operator
+  (be explicit it's "trust the operator, verifiable accounting").
 - **P2** anti-cheat: rate caps vs physical hashrate, challenge sub-ranges, stake slashing.
 - **P3** distribute custody: t-of-n threshold-ECDSA / MPC (likely a fixed small committee).
 - **P4** protected settlement: private-relay/miner submission, rehearsed on a **low-value
