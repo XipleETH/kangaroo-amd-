@@ -16,12 +16,12 @@
 // ---- problem / tuning ----
 #define RANGE_BITS 40
 #define N_JUMPS    32
-#define N_TAME     131072
-#define N_WILD     131072
-#define N_KANG     (N_TAME + N_WILD)   // 262144
-#define GN         16         // kangaroos per thread (Montgomery batch inversion); N_KANG % GN == 0
-#define NUM_THREADS (N_KANG / GN)      // 16384
-#define DP_BITS    8
+#define N_TAME     2097152
+#define N_WILD     2097152
+#define N_KANG     (N_TAME + N_WILD)   // 4194304
+#define GN         64         // kangaroos per thread (Montgomery batch inversion); N_KANG % GN == 0
+#define NUM_THREADS (N_KANG / GN)      // 65536 threads (~1.17 G ops/s; peak ~1.19 G at 131072)
+#define DP_BITS    20
 #define STEPS      256
 #define MAX_DP     (1u << 21)
 #define MAX_ITERS  20000
@@ -53,7 +53,7 @@ __global__ void k_mkkang(fe* kx, fe* ky, u64* kd, unsigned char* kt,
     if (i >= N_KANG) return;
     if (i < N_TAME) {
         // spread tame kangaroos across [0, 2^RANGE_BITS): step = 2^RANGE_BITS / N_TAME
-        u64 s = (u64)i << (RANGE_BITS - 17);   // N_TAME = 2^17 = 131072
+        u64 s = (u64)i * ((1ULL<<RANGE_BITS) / N_TAME);
         jpt P = scalar_mul_G_jac(fe_set(s,0,0,0));
         kx[i]=P.x; ky[i]=P.y; kd[i]=s; kt[i]=0;
     } else {

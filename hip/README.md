@@ -14,24 +14,34 @@ that WGSL cannot express.
 | 2a. **256-bit field arithmetic** (`field_test.hip`) | ✅ **correct + fast** |
 | 2b. **EC point ops** (`ec_test.hip`) | ✅ **correct, anchored to secp256k1** |
 | 2c/3. **Full kangaroo solver** (`kangaroo.hip`) | ✅ **WORKS — recovers the 40-bit key** |
-| 4a. **Montgomery batch inversion** (global-backed) | ✅ **~230 M ops/s (~4.6× WGSL)** |
-| 4b. Further tuning (faster fe_inv, GN sweep, wave tuning) | ⬜ next — toward ~1 G |
+| 4. **Optimized batch-inversion solver** | ✅ **~1.17 G ops/s (~23× WGSL)** |
 
 ## Working solver (`kangaroo.hip`)
 
 2-set (tame/wild) Pollard's Kangaroo, u64 distances. Recovers `k = 0xe9ae4933d6` from
 `Q = k·G` on `[0, 2^40)` — first native-AMD kangaroo that solves an ECDLP.
 
-**Speed progression on the RX 7800 XT:**
-- Per-step inversion (one `fe_inv`/step): ~12 M ops/s.
-- **Global-backed Montgomery batch inversion** (`k_walk_gb`, GN=16, group state streamed
-  from global memory, prefix products in a scratch buffer, Jacobian setup): **~230 M ops/s
-  — ~4.6× the WGSL kernel, ~19× the naive HIP.** Native `fe_mul` is ~13.6 G/s so headroom
-  remains: a faster `fe_inv` (Dettman addition chain vs the current square-and-multiply),
-  a GN/wavefront sweep, and larger herds should push toward the projected ~1 G ops/s.
+**Speed progression on the RX 7800 XT (each step verified: recovers the key):**
 
-Also TODO for real targets: 256-bit distances (currently u64, ok to ~2^48), negation map,
-pubkey-y recovery (modular sqrt), a dx==0 guard, and cycle detection.
+| Version | ops/s | vs WGSL |
+|---|---|---|
+| WGSL/Vulkan (previous ceiling) | 50 M | 1× |
+| HIP, per-step inversion | 12 M | 0.24× |
+| + global-backed Montgomery batch inversion (GN=16) | 230 M | 4.6× |
+| + Dettman `fe_inv` addition chain | 429 M | 8.6× |
+| + GN=32 | 638 M | 12.8× |
+| + GN=64 | 844 M | 17× |
+| + more threads (65536) | **1174 M** | **~23×** |
+| (peak, 131072 threads) | 1191 M | ~24× |
+
+**~1.17 G ops/s** — in the same order of magnitude as an Nvidia RTX 3090 running RCKangaroo
+(~4 G on a much larger card), i.e. competitive per-tier. What made it: global-backed group
+state (registers spilled), the Dettman inversion chain, large GN, and heavy occupancy.
+Native `fe_mul` is ~13.6 G/s, so remaining headroom is compute (a dedicated `fe_sqr` — the
+255 squarings in `fe_inv` still call `fe_mul(a,a)`) and less global streaming.
+
+TODO for real targets (#135): 256-bit distances (currently u64, ok to ~2^48), negation map,
+pubkey-y recovery (modular sqrt), a `dx==0` guard, and cycle detection.
 
 ## Key result (Stage 2a) — the top risk is refuted
 

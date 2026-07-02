@@ -79,13 +79,46 @@ __device__ inline fe fe_mul(const fe& a, const fe& b) {
 }
 __device__ inline fe fe_sqr(const fe& a){ return fe_mul(a,a); }
 
+// a^(p-2) via Peter Dettman's addition chain (255 squarings + 15 muls),
+// the libsecp256k1 chain. ~3x fewer field ops than square-and-multiply.
 __device__ inline fe fe_inv(const fe& a){
-    fe result=fe_one(), base=a;
-    for (int limb=0;limb<4;++limb){
-        u64 e=SECP_Pm2[limb];
-        for (int b=0;b<64;++b){ if (e&1ULL) result=fe_mul(result,base); base=fe_sqr(base); e>>=1; }
-    }
-    return result;
+    fe a2 = fe_sqr(a);
+    fe x2 = fe_mul(a2, a);            // a^(2^2-1)
+    fe t  = fe_sqr(x2);
+    fe x3 = fe_mul(t, a);             // a^(2^3-1)
+    t = x3;
+    for (int i=0;i<3;++i) t = fe_sqr(t);
+    t = fe_mul(t, x3);               // a^(2^6-1)
+    for (int i=0;i<3;++i) t = fe_sqr(t);
+    t = fe_mul(t, x3);               // a^(2^9-1)
+    for (int i=0;i<2;++i) t = fe_sqr(t);
+    fe x11 = fe_mul(t, x2);          // a^(2^11-1)
+    t = x11;
+    for (int i=0;i<11;++i) t = fe_sqr(t);
+    fe x22 = fe_mul(t, x11);         // a^(2^22-1)
+    t = x22;
+    for (int i=0;i<22;++i) t = fe_sqr(t);
+    fe x44 = fe_mul(t, x22);         // a^(2^44-1)
+    t = x44;
+    for (int i=0;i<44;++i) t = fe_sqr(t);
+    fe x88 = fe_mul(t, x44);         // a^(2^88-1)
+    t = x88;
+    for (int i=0;i<88;++i) t = fe_sqr(t);
+    t = fe_mul(t, x88);              // a^(2^176-1)
+    for (int i=0;i<44;++i) t = fe_sqr(t);
+    t = fe_mul(t, x44);              // a^(2^220-1)
+    for (int i=0;i<3;++i) t = fe_sqr(t);
+    t = fe_mul(t, x3);               // a^(2^223-1)
+    for (int i=0;i<23;++i) t = fe_sqr(t);
+    t = fe_mul(t, x22);
+    for (int i=0;i<4;++i) t = fe_sqr(t);   // 4 zero bits
+    for (int i=0;i<2;++i) t = fe_sqr(t);
+    t = fe_mul(t, a2);               // window '10' -> a^2
+    for (int i=0;i<2;++i) t = fe_sqr(t);
+    t = fe_mul(t, x2);               // window '11' -> a^3
+    for (int i=0;i<2;++i) t = fe_sqr(t);
+    t = fe_mul(t, a);                // window '01' -> a
+    return t;
 }
 
 // small PRNG for tests
