@@ -13,18 +13,22 @@
 
 #define CHECK(c) do{ hipError_t e=(c); if(e!=hipSuccess){ printf("HIP %s:%d %s\n",__FILE__,__LINE__,hipGetErrorString(e)); return 1; } }while(0)
 
-// ---- problem / tuning ----
+// ---- problem / tuning (RANGE_BITS and DP_BITS overridable via -D for sweeps) ----
+#ifndef RANGE_BITS
 #define RANGE_BITS 40
+#endif
 #define N_JUMPS    32
-#define N_TAME     2097152
-#define N_WILD     2097152
-#define N_KANG     (N_TAME + N_WILD)   // 4194304
+#define N_TAME     1048576
+#define N_WILD     1048576
+#define N_KANG     (N_TAME + N_WILD)   // 2097152 (32768 threads @ GN=64 ~ 1.04 G ops/s)
 #define GN         64         // kangaroos per thread (Montgomery batch inversion); N_KANG % GN == 0
-#define NUM_THREADS (N_KANG / GN)      // 65536 threads (~1.17 G ops/s; peak ~1.19 G at 131072)
-#define DP_BITS    20
+#define NUM_THREADS (N_KANG / GN)
+#ifndef DP_BITS
+#define DP_BITS    9
+#endif
 #define STEPS      256
 #define MAX_DP     (1u << 21)
-#define MAX_ITERS  20000
+#define MAX_ITERS  200000
 
 // affine add of DISTINCT points, inline (kangaroo hot path)
 __device__ inline void ec_add_inplace(fe& x, fe& y, const fe& jx, const fe& jy) {
@@ -181,8 +185,9 @@ int main() {
     printf("Device: %s (%s)\n", prop.name, prop.gcnArchName);
     printf("Problem: k*G, k in [0, 2^%d).  kangaroos=%d  dp_bits=%d\n", RANGE_BITS, N_KANG, DP_BITS);
 
-    // test key (0xe9ae4933d6) -> builds Q = k*G on device (solver recovers k independently)
-    const u64 KTEST[4] = { 0xE9AE4933D6ULL, 0, 0, 0 };
+    // test key near the MIDDLE of [0,2^RANGE_BITS) so the kangaroo is efficient at any range.
+    // Q = k*G is built on device; the solver recovers k independently (doesn't use it).
+    const u64 KTEST[4] = { (1ULL << (RANGE_BITS-1)) + 0x12345ULL, 0, 0, 0 };
 
     // jump scalars: mean ~ 2^(RANGE_BITS/2)
     u64 h_js[N_JUMPS];
@@ -218,7 +223,7 @@ int main() {
                 kx,ky,kd,kt,jx,jy,js,N_JUMPS,PRE,dpx,dpd,dpt,dpcnt,STEPS,dpmask); }
         CHECK(hipDeviceSynchronize());
         hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1);
-        const int NB=60; hipEventRecord(e0);
+        const int NB=8; hipEventRecord(e0);
         for (int b=0;b<NB;++b){ hipMemset(dpcnt,0,4);
             hipLaunchKernelGGL(k_walk_gb, dim3((NUM_THREADS+255)/256),dim3(256),0,0,
                 kx,ky,kd,kt,jx,jy,js,N_JUMPS,PRE,dpx,dpd,dpt,dpcnt,STEPS,dpmask); }
@@ -232,8 +237,10 @@ int main() {
     printf("walking...\n");
 
     // host DP table
-    std::unordered_map<std::string, std::pair<u64,unsigned char>> table;
-    table.reserve(1<<20);
+    // keyed by low 64 bits of x; false collisions are astronomically rare and are
+    // caught by the on-GPU k*G==Q verify, so a wrong key can never be reported.
+    std::unordered_map<u64, std::pair<u64,unsigned char>> table;
+    table.reserve(1u<<22);
     fe*  h_dpx = new fe[MAX_DP];
     u64* h_dpd = new u64[MAX_DP];
     unsigned char* h_dpt = new unsigned char[MAX_DP];
@@ -256,7 +263,7 @@ int main() {
             CHECK(hipMemcpy(h_dpt,dpt,cnt*sizeof(unsigned char),hipMemcpyDeviceToHost));
         }
         for (unsigned j=0;j<cnt && !solved;++j) {
-            std::string key((const char*)h_dpx[j].n, 32);
+            u64 key = h_dpx[j].n[0];
             auto f = table.find(key);
             if (f==table.end()) { table.emplace(key, std::make_pair(h_dpd[j], h_dpt[j])); }
             else if (f->second.second != h_dpt[j]) {
@@ -278,9 +285,10 @@ int main() {
     double sec = std::chrono::duration<double>(t1-t0).count();
 
     if (solved) {
-        printf("\nSOLVED! k = 0x%llx  (expected 0xe9ae4933d6)\n", (unsigned long long)found_k);
-        printf("%s\n", found_k==0xE9AE4933D6ULL ? "MATCH -> NATIVE HIP KANGAROO WORKS" : "verified but != expected (?)");
-    } else printf("\nNOT solved within %d iters\n", MAX_ITERS);
-    printf("ops=%.3e in %.2fs = %.1f M ops/s\n", (double)total_ops, sec, total_ops/(sec*1e6));
+        printf("\nrange %d: SOLVED! k = 0x%llx (expected 0x%llx) %s\n", RANGE_BITS,
+               (unsigned long long)found_k, (unsigned long long)KTEST[0],
+               found_k==KTEST[0] ? "MATCH" : "MISMATCH?");
+    } else printf("\nrange %d: NOT solved within %d iters\n", RANGE_BITS, MAX_ITERS);
+    printf("range %d: solve %.3e ops in %.3fs = %.0f M ops/s\n", RANGE_BITS, (double)total_ops, sec, total_ops/(sec*1e6));
     return solved?0:1;
 }
