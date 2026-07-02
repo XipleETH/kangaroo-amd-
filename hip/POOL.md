@@ -79,6 +79,45 @@ pool_demo detect c0.dp c1.dp c2.dp
 its DP isn't on the shared walk. That residual is **not closable by cryptography** — it needs
 rate-limits vs physical hashrate + refundable stake. Validation ≠ proof-of-work.
 
+### Anti-cheat hardening: dedup + replay defense ✅ (with an honest fairness caveat)
+
+Two more concrete cheats closed on top of endpoint validation:
+
+- **Inflation** — a client re-submitting DPs to pad its count.
+- **Replay/theft** — a client copying another's DPs and relabeling them as its own
+  (the `client` field is self-asserted). `faker`/`replay` modes simulate both.
+
+Fix: **dedup by full `(x,type,dist)`, first submitter wins.** Two legitimately-distinct
+endpoints never share the tuple; a repeat or a relabeled copy is an exact duplicate and is
+credited to whoever submitted it first. Demo with a faker (c2) + a replayer (c3 copies c0):
+
+```
+  client   valid       unique      invalid     share
+  0        1315744     189575      0            97.9%
+  1        1245743     3989        0             2.1%
+  2        0           0           500000        0.0%   <- fakes: all rejected
+  3        1315744     0           0             0.0%   <- replay of c0: all dups -> credited to c0
+```
+
+Faker and replayer both earn **0%**; the collision still solves.
+
+**Honest fairness caveat — the demo exposed it, don't hide it:** the 97.9/2.1 split does NOT
+reflect that c0 and c1 did *equal* GPU work. It is a **tiny-range artifact**. At 2^40 the
+herds collapse — many kangaroos merge into few trails and re-emit identical DPs; the wilds
+start clustered in a 2^18 window near Q (density 2^0 = one kangaroo per point) so they collapse
+~40× harder than the tames (spread over the full 2^40, density 2^-22) → only ~4k unique wild
+DPs. **`unique`-DP-count equals compute only in the SPARSE regime.** At real #135 scale
+(interval 2^134, herd ~2^18 → density 2^-116) kangaroos essentially never merge → `unique ≈
+raw ≈ compute` → the split is fair. Rate-limiting vs physical hashrate is the backstop for the
+residual skew.
+
+**Two honest limits remain (→ P1 networking):**
+
+- *first-submitter-wins depends on receive order* — a thief who submits a stolen DP **before**
+  its honest producer would win it. True fix = **per-client signed submissions** (server-
+  registered keys) so a DP is cryptographically bound to its producer, not self-asserted.
+- the *smart-faker* residual → stake + rate-limits, not code.
+
 ### Why a canonical spec is mandatory (the real interop blocker)
 
 DPs from two clients only collide if **every client iterates the identical map**
@@ -122,6 +161,8 @@ Nvidia client (RCKangaroo   ├─ DP batches (TLS, canonical-spec-tagged)
 
 - **P0 ✅** cross-client DP pooling + collision + attribution (`pool_demo.hip`).
 - **P1a ✅** DP endpoint validation + fair-share accounting + fake-DP rejection (in the demo).
+- **P1b ✅** anti-cheat hardening: dedup by `(x,type,dist)` (defeats inflation + replay);
+  honest fairness caveat documented (unique==compute only in the sparse/real-target regime).
 - **P1** trust-minimized MVP: turn the in-process detector into a **networked coordination
   server** (leases + validate + dedup + detect over the wire), AMD adapter on `kangaroo.hip`,
   **RCKangaroo fork + sidecar**, signed Merkle contribution log. Custody = single operator

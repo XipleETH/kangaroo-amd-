@@ -138,6 +138,28 @@ static int run_faker(int id, const char* outfile, int count){
     return 0;
 }
 
+// A thief who copies another client's DP file and relabels it as its own, to steal share.
+// (self-asserted `client` field — nothing binds a DP to its producer without signatures.)
+static int run_replay(int id, const char* src, const char* out){
+    setvbuf(stdout,NULL,_IONBF,0);
+    std::vector<DP> recs; FILE* f=fopen(src,"rb"); if(!f){ printf("cannot open %s\n",src); return 1; }
+    DP r; while(fread(&r,sizeof(DP),1,f)==1){ r.client=(u32)id; recs.push_back(r); } fclose(f);
+    FILE* g=fopen(out,"wb"); if(!g){ printf("cannot open %s\n",out); return 1; }
+    fwrite(recs.data(),sizeof(DP),recs.size(),g); fclose(g);
+    printf("replay: relabeled %zu DPs from %s as client %d -> %s\n", recs.size(), src, id, out);
+    return 0;
+}
+// Dedup key = full (x, type, dist); ties broken by load order so the FIRST submitter wins.
+static const DP* G_all;
+static int idxcmp(const void* pa, const void* pb){
+    int ia=*(const int*)pa, ib=*(const int*)pb; const DP&a=G_all[ia]; const DP&b=G_all[ib];
+    for(int j=0;j<4;++j){ if(a.x[j]!=b.x[j]) return a.x[j]<b.x[j]?-1:1; }
+    if(a.type!=b.type) return a.type<b.type?-1:1;
+    if(a.dist!=b.dist) return a.dist<b.dist?-1:1;
+    return ia<ib?-1:(ia>ib?1:0);
+}
+static bool tuple_eq(const DP&a,const DP&b){ return xeq(a,b)&&a.type==b.type&&a.dist==b.dist; }
+
 static int run_detect(int nfiles, char** files){
     setvbuf(stdout,NULL,_IONBF,0);
     std::vector<DP> all;
@@ -164,14 +186,20 @@ static int run_detect(int nfiles, char** files){
         CHECK(hipDeviceSynchronize()); }
     std::vector<unsigned char> ok(n); CHECK(hipMemcpy(ok.data(),dok,n,hipMemcpyDeviceToHost));
 
-    // Per-client contribution accounting — only endpoint-VALID DPs count.
-    long vc[MAXC]={0}, ic[MAXC]={0}; long totv=0; bool seen[MAXC]={false};
+    // Per-client accounting: endpoint-VALID, then DEDUPED by (x,type,dist) so a client
+    // cannot inflate its share by repeating its own DPs or replaying another's. Each unique
+    // DP is credited to its FIRST submitter (load order here stands in for receive order).
+    long vc[MAXC]={0}, ic[MAXC]={0}, uc[MAXC]={0}; long totv=0, totu=0; bool seen[MAXC]={false};
     for(int i=0;i<n;++i){ u32 c=all[i].client; if(c<MAXC){ seen[c]=true; if(ok[i]){vc[c]++; totv++;} else ic[c]++; } }
-    printf("\nContribution (only endpoint-verified DPs earn a share; fakes rejected):\n");
-    printf("  client   valid       invalid     share\n");
+    std::vector<int> vidx; vidx.reserve(totv); for(int i=0;i<n;++i) if(ok[i]) vidx.push_back(i);
+    G_all=all.data(); if(!vidx.empty()) qsort(vidx.data(), vidx.size(), sizeof(int), idxcmp);
+    for(size_t r=0;r<vidx.size();++r)
+        if(r==0 || !tuple_eq(all[vidx[r]], all[vidx[r-1]])){ u32 c=all[vidx[r]].client; if(c<MAXC){ uc[c]++; totu++; } }
+    printf("\nContribution (endpoint-valid, then deduped — only UNIQUE work earns a share):\n");
+    printf("  client   valid       unique      invalid     share\n");
     for(int c=0;c<MAXC;++c) if(seen[c])
-        printf("  %-6d   %-10ld  %-10ld  %5.1f%%\n", c, vc[c], ic[c], totv?100.0*vc[c]/totv:0.0);
-    printf("  total valid = %ld\n", totv);
+        printf("  %-6d   %-10ld  %-10ld  %-10ld  %5.1f%%\n", c, vc[c], uc[c], ic[c], totu?100.0*uc[c]/totu:0.0);
+    printf("  total valid = %ld, unique credited = %ld  (dups & fakes earn nothing)\n", totv, totu);
 
     // Collision detection among VALID DPs only.
     std::vector<DP> valid; valid.reserve(totv);
@@ -201,9 +229,12 @@ int main(int argc, char** argv){
         return run_client(atoi(argv[2]), strcmp(argv[3],"wild")==0?1:0, argv[4], atoi(argv[5]));
     if(argc==5 && strcmp(argv[1],"faker")==0)
         return run_faker(atoi(argv[2]), argv[3], atoi(argv[4]));
+    if(argc==5 && strcmp(argv[1],"replay")==0)
+        return run_replay(atoi(argv[2]), argv[3], argv[4]);
     if(argc>=3 && strcmp(argv[1],"detect")==0)
         return run_detect(argc-2, argv+2);
     printf("usage:\n  %s client <id> <tame|wild> <out.dp> <dispatches>\n"
-           "  %s faker  <id> <out.dp> <count>\n  %s detect <f0.dp> <f1.dp> ...\n", argv[0], argv[0], argv[0]);
+           "  %s faker  <id> <out.dp> <count>\n  %s replay <id> <src.dp> <out.dp>\n"
+           "  %s detect <f0.dp> <f1.dp> ...\n", argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }
