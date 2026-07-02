@@ -46,7 +46,7 @@ __global__ void k_mkjumps(fe* jx, fe* jy, const u64* js){ int i=blockIdx.x*block
 // role 0 = tame (spread over range), role 1 = wild (near Q)
 __global__ void k_mkkang(fe* kx, fe* ky, u64* kd, const fe* Qx, const fe* Qy, int role){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=HERD)return;
-    if(role==0){ u64 s=(u64)i*((1ULL<<RANGE_BITS)/HERD); jpt P=scalar_mul_G_jac(fe_set(s,0,0,0)); kx[i]=P.x; ky[i]=P.y; kd[i]=s; }
+    if(role==0){ u64 s=(u64)i*((1ULL<<RANGE_BITS)/HERD)+1ULL; jpt P=scalar_mul_G_jac(fe_set(s,0,0,0)); kx[i]=P.x; ky[i]=P.y; kd[i]=s; }  // +1: index 0 must not be O
     else { u64 w=(u64)i; jpt off=scalar_mul_G_jac(fe_set(w,0,0,0)); jpt Q; Q.inf=false; Q.x=*Qx; Q.y=*Qy;
            jpt P=j_add(Q,off); kx[i]=P.x; ky[i]=P.y; kd[i]=w; }
 }
@@ -67,7 +67,6 @@ __global__ void k_walk(fe* kx, fe* ky, u64* kd, const fe* jx, const fe* jy, cons
     }
 }
 
-#define MAXC 64
 // Validate a DP endpoint on the GPU: a real tame DP satisfies dist*G == P; a real
 // wild DP satisfies Q + dist*G == P. Plus the DP mask. This is the TRUSTLESS layer:
 // it deterministically rejects garbage/fabricated DPs (their dist*G != their x).
@@ -75,8 +74,10 @@ __global__ void k_verify(const DP* dps, int n, fe Qx, fe Qy, u64 dpmask, unsigne
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n)return;
     DP d=dps[i];
     if((d.x[0]&dpmask)!=0ULL){ ok[i]=0; return; }                 // fails the DP mask
+    if(d.dist==0ULL){ ok[i]=0; return; }                          // dist 0 -> point at infinity: forgery guard
     jpt P=scalar_mul_G_jac(fe_set(d.dist,0,0,0));
     if(d.type==1){ jpt Q; Q.inf=false; Q.x=Qx; Q.y=Qy; P=j_add(Q,P); }  // wild: + Q
+    if(P.inf){ ok[i]=0; return; }                                 // degenerate point, never a real DP
     fe X=fe_set(d.x[0],d.x[1],d.x[2],d.x[3]);
     ok[i]=fe_eq(P.x,X)?1:0;
 }
@@ -159,6 +160,9 @@ static int idxcmp(const void* pa, const void* pb){
     return ia<ib?-1:(ia>ib?1:0);
 }
 static bool tuple_eq(const DP&a,const DP&b){ return xeq(a,b)&&a.type==b.type&&a.dist==b.dist; }
+static int u32cmp(const void* a, const void* b){ u32 x=*(const u32*)a,y=*(const u32*)b; return x<y?-1:(x>y?1:0); }
+static int find_id(const u32* uid, int nc, u32 c){ int lo=0,hi=nc-1;
+    while(lo<=hi){ int m=(lo+hi)>>1; if(uid[m]==c)return m; if(uid[m]<c)lo=m+1; else hi=m-1; } return -1; }
 
 static int run_detect(int nfiles, char** files){
     setvbuf(stdout,NULL,_IONBF,0);
@@ -186,19 +190,25 @@ static int run_detect(int nfiles, char** files){
         CHECK(hipDeviceSynchronize()); }
     std::vector<unsigned char> ok(n); CHECK(hipMemcpy(ok.data(),dok,n,hipMemcpyDeviceToHost));
 
-    // Per-client accounting: endpoint-VALID, then DEDUPED by (x,type,dist) so a client
-    // cannot inflate its share by repeating its own DPs or replaying another's. Each unique
-    // DP is credited to its FIRST submitter (load order here stands in for receive order).
-    long vc[MAXC]={0}, ic[MAXC]={0}, uc[MAXC]={0}; long totv=0, totu=0; bool seen[MAXC]={false};
-    for(int i=0;i<n;++i){ u32 c=all[i].client; if(c<MAXC){ seen[c]=true; if(ok[i]){vc[c]++; totv++;} else ic[c]++; } }
+    // Compact the (arbitrary, self-asserted) client ids so accounting has NO fixed cap and no
+    // huge-id allocation: sort-unique the ids, then index counts by position.
+    std::vector<u32> ids(n); for(int i=0;i<n;++i) ids[i]=all[i].client;
+    qsort(ids.data(), n, sizeof(u32), u32cmp);
+    std::vector<u32> uid; for(int i=0;i<n;++i) if(i==0||ids[i]!=ids[i-1]) uid.push_back(ids[i]);
+    int NC=(int)uid.size();
+    // Per-client accounting: endpoint-VALID, then DEDUPED by (x,type,dist) so a client cannot
+    // inflate its share by repeating its own DPs or replaying another's. Each unique DP is
+    // credited to its FIRST submitter (load order here stands in for receive order).
+    std::vector<long> vc(NC,0), ic(NC,0), uc(NC,0); long totv=0, totu=0;
+    for(int i=0;i<n;++i){ int c=find_id(uid.data(),NC,all[i].client); if(ok[i]){vc[c]++; totv++;} else ic[c]++; }
     std::vector<int> vidx; vidx.reserve(totv); for(int i=0;i<n;++i) if(ok[i]) vidx.push_back(i);
     G_all=all.data(); if(!vidx.empty()) qsort(vidx.data(), vidx.size(), sizeof(int), idxcmp);
     for(size_t r=0;r<vidx.size();++r)
-        if(r==0 || !tuple_eq(all[vidx[r]], all[vidx[r-1]])){ u32 c=all[vidx[r]].client; if(c<MAXC){ uc[c]++; totu++; } }
+        if(r==0 || !tuple_eq(all[vidx[r]], all[vidx[r-1]])){ int c=find_id(uid.data(),NC,all[vidx[r]].client); uc[c]++; totu++; }
     printf("\nContribution (endpoint-valid, then deduped — only UNIQUE work earns a share):\n");
     printf("  client   valid       unique      invalid     share\n");
-    for(int c=0;c<MAXC;++c) if(seen[c])
-        printf("  %-6d   %-10ld  %-10ld  %-10ld  %5.1f%%\n", c, vc[c], uc[c], ic[c], totu?100.0*uc[c]/totu:0.0);
+    for(int c=0;c<NC;++c)
+        printf("  %-6u   %-10ld  %-10ld  %-10ld  %5.1f%%\n", uid[c], vc[c], uc[c], ic[c], totu?100.0*uc[c]/totu:0.0);
     printf("  total valid = %ld, unique credited = %ld  (dups & fakes earn nothing)\n", totv, totu);
 
     // Collision detection among VALID DPs only.

@@ -118,6 +118,22 @@ residual skew.
   registered keys) so a DP is cryptographically bound to its producer, not self-asserted.
 - the *smart-faker* residual → stake + rate-limits, not code.
 
+### Adversarial review pass ✅ (12-agent review of the payout-gating code)
+
+A multi-agent adversarial review of `k_verify` + the accounting found **5 confirmed defects**;
+all are now handled and each fix was verified by running the demo:
+
+- **inflation (no dedup)** & **replay/theft** — already closed by the dedup + first-submitter-
+  wins above. (A *submit-first* thief still needs signatures to stop → P1 networking.)
+- **zero-DP forgery** *(was high severity)* — `(x=0, dist=0, tame)` satisfied `dist·G==P`
+  because `scalar_mul(0)=O` has x=0, so the validator accepted it as real work. **Fixed:**
+  reject `dist==0` and any infinity point in `k_verify`. *Verified:* 1000 forged zero-DPs →
+  0 credited, 1000 invalid.
+- **off-curve tame seed** — tame index 0 started at `0·G = O` stored as `(0,0)` (off the
+  curve) → a garbage walk. **Fixed:** `+1` start offset so no kangaroo seeds at O.
+- **`MAXC=64` cap** — clients with id ≥ 64 were silently uncounted (their share lost).
+  **Fixed:** compact distinct-id accounting, no cap. *Verified:* client id 300 credited 2.1%.
+
 ### Why a canonical spec is mandatory (the real interop blocker)
 
 DPs from two clients only collide if **every client iterates the identical map**
@@ -163,6 +179,8 @@ Nvidia client (RCKangaroo   ├─ DP batches (TLS, canonical-spec-tagged)
 - **P1a ✅** DP endpoint validation + fair-share accounting + fake-DP rejection (in the demo).
 - **P1b ✅** anti-cheat hardening: dedup by `(x,type,dist)` (defeats inflation + replay);
   honest fairness caveat documented (unique==compute only in the sparse/real-target regime).
+- **P1c ✅** adversarial-review fixes: zero-DP forgery guard, off-curve seed fix, `MAXC` cap
+  removed (arbitrary client ids). All verified by re-running the demo.
 - **P1** trust-minimized MVP: turn the in-process detector into a **networked coordination
   server** (leases + validate + dedup + detect over the wire), AMD adapter on `kangaroo.hip`,
   **RCKangaroo fork + sidecar**, signed Merkle contribution log. Custody = single operator
