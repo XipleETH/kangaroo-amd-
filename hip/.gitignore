@@ -2,5 +2,7 @@
 *.obj
 *.o
 *.log
+*_compile.txt
+*.dp
 compile_out.txt
 diag*.bat
